@@ -1,4 +1,4 @@
-name: Mustafa TV - Build 8 Fast Receive - Optional Async and Direct Rendering
+name: Mustafa TV - Build 8 Fixed UI Section Detection
 on:
   push:
     branches:
@@ -756,7 +756,7 @@ jobs:
         settings = BASE / 'ui/SettingsScreen.kt'
         src = settings.read_text(encoding='utf8')
         start = src.index('@Composable\nfun SettingsScreen(')
-        end = src.index('\nprivate fun canAutoLaunch', start)
+        end = src.index('\n@Composable\nprivate fun MustafaSettingsIntro()', start)
         section = src[start:end]
         assert section.count('MustafaSettingsGroup(') == 5, 'Mustafa UI section count changed'
         assert section.count('MustafaSettingsIntro()') == 1
