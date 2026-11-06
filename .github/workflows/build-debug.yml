@@ -1,0 +1,44 @@
+name: Build AirPlay Debug APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-debug.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build tools
+        run: sdkmanager 'platforms;android-37' 'ndk;27.0.12077973' 'cmake;3.22.1'
+
+      - name: Build Debug APK
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:assembleDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AirPlay-TV-debug
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
