@@ -29,7 +29,8 @@ jobs:
         uses: android-actions/setup-android@v4
 
       - name: Install Android build tools
-        run: sdkmanager 'platforms;android-37' 'ndk;27.0.12077973' 'cmake;3.22.1'
+        run: |
+          sdkmanager 'platforms;android-37.0' 'ndk;27.0.12077973' 'cmake;3.22.1'
 
       - name: Build Debug APK
         run: |
