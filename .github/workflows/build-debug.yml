@@ -1,4 +1,4 @@
-name: Build AirPlay Debug APK
+name: AirPlay TV - Stretch + Low Latency Debug APK
 
 on:
   push:
@@ -14,12 +14,12 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout project
+      - name: Checkout sources and native submodules
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Set up Java
+      - name: Set up Java 21
         uses: actions/setup-java@v4
         with:
           distribution: zulu
@@ -28,18 +28,129 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Install Android build tools
+      - name: Install required Android SDK and native tools
         run: |
           sdkmanager 'platforms;android-37.0' 'ndk;27.0.12077973' 'cmake;3.22.1'
 
-      - name: Build Debug APK
+      - name: Apply Stretch and decoded-frame latency optimization
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          ui = Path('app/src/main/kotlin/io/github/jqssun/airplay/ui/MainScreen.kt')
+          source = ui.read_text(encoding='utf-8')
+          before = '''    val video: @Composable () -> Unit = {
+                  val aspect by viewModel.videoAspect.collectAsState()
+                  VideoSurfaceView(
+                      onSurfaceAvailable = onSurfaceAvailable,
+                      onSurfaceDestroyed = onSurfaceDestroyed,
+                      aspectRatio = aspect
+                  )
+              }'''
+          after = '''    val video: @Composable () -> Unit = {
+                  VideoSurfaceView(
+                      onSurfaceAvailable = onSurfaceAvailable,
+                      onSurfaceDestroyed = onSurfaceDestroyed,
+                      applyAspectRatio = false,
+                      modifier = Modifier.fillMaxSize()
+                  )
+              }'''
+          if source.count(before) != 1:
+              raise SystemExit('FAIL: mirroring layout changed; cannot apply safe Stretch patch')
+          ui.write_text(source.replace(before, after, 1), encoding='utf-8')
+
+          prefs = Path('app/src/main/kotlin/io/github/jqssun/airplay/Prefs.kt')
+          source = prefs.read_text(encoding='utf-8')
+          debug_old = 'val DEBUG_ENABLED = bool("debug_enabled", false)'
+          debug_new = 'val DEBUG_ENABLED = bool("debug_enabled", true)'
+          if source.count(debug_old) != 1:
+              raise SystemExit('FAIL: debug setting changed; cannot enable diagnostic overlay')
+          prefs.write_text(source.replace(debug_old, debug_new, 1), encoding='utf-8')
+
+          # Avoid presenting obsolete frames when decoder output has queued up.
+          # The compressed stream stays intact; only decoded DISPLAY frames can be skipped.
+          decoder = Path('app/src/main/kotlin/io/github/jqssun/airplay/renderer/VideoRenderer.kt')
+          renderer = decoder.read_text(encoding='utf-8')
+          old_drain = '''    private fun drainOutput() {
+                  val c = codec ?: return
+                  val info = MediaCodec.BufferInfo()
+                  while (true) {
+                      val idx = c.dequeueOutputBuffer(info, 0)
+                      if (idx < 0) break
+                      _recordOutputFrameTime()
+                      if (scheduledOutputBufferRelease) {
+                          // schedule frame at VSYNC matching its NTP presentation time
+                          val ptsUs = info.presentationTimeUs
+                          if (_ptsBaseUs == Long.MIN_VALUE) {
+                              _ptsBaseUs = ptsUs
+                              _wallBaseNs = System.nanoTime()
+                          }
+                          c.releaseOutputBuffer(idx, _wallBaseNs + (ptsUs - _ptsBaseUs) * 1000L)
+                      } else {
+                          c.releaseOutputBuffer(idx, true)
+                      }
+                  }
+              }'''
+          new_drain = '''    private fun drainOutput() {
+                  val c = codec ?: return
+                  val info = MediaCodec.BufferInfo()
+                  var latest = -1
+                  var latestPtsUs = 0L
+                  while (true) {
+                      val idx = c.dequeueOutputBuffer(info, 0)
+                      if (idx < 0) break
+                      // All packets were decoded. Discard stale DISPLAY buffers only:
+                      // this avoids damaging the inter-frame reference chain.
+                      if (latest >= 0) {
+                          c.releaseOutputBuffer(latest, false)
+                          droppedFrames++
+                      }
+                      latest = idx
+                      latestPtsUs = info.presentationTimeUs
+                  }
+                  if (latest < 0) return
+                  _recordOutputFrameTime()
+                  if (scheduledOutputBufferRelease) {
+                      if (_ptsBaseUs == Long.MIN_VALUE) {
+                          _ptsBaseUs = latestPtsUs
+                          _wallBaseNs = System.nanoTime()
+                      }
+                      c.releaseOutputBuffer(latest, _wallBaseNs + (latestPtsUs - _ptsBaseUs) * 1000L)
+                  } else {
+                      // Low-latency mode: render the latest decoded frame immediately.
+                      c.releaseOutputBuffer(latest, true)
+                  }
+              }'''
+          if renderer.count(old_drain) != 1:
+              raise SystemExit('FAIL: VideoRenderer drainOutput differs; refusing risky patch')
+          decoder.write_text(renderer.replace(old_drain, new_drain, 1), encoding='utf-8')
+          result = decoder.read_text(encoding='utf-8')
+          assert result.count('c.releaseOutputBuffer(latest, false)') == 1
+          assert result.count('c.releaseOutputBuffer(latest, true)') == 1
+          print('PASS: low-latency video now keeps latest decoded frame when backlog accumulates')
+
+          verified_ui = ui.read_text(encoding='utf-8')
+          assert verified_ui.count('applyAspectRatio = false,\n            modifier = Modifier.fillMaxSize()') == 1
+          assert prefs.read_text(encoding='utf-8').count(debug_new) == 1
+          print('PASS: Stretch mirror preview uses whole TV surface, no aspect-ratio restriction')
+          print('PASS: Debug overlay enabled by default for new installations')
+          PY
+          git diff --check
+          git diff --stat
+
+      - name: Build APK
         run: |
           chmod +x ./gradlew
           ./gradlew :app:assembleDebug --no-daemon
 
+      - name: Validate generated APK
+        run: |
+          test -s app/build/outputs/apk/debug/app-debug.apk
+          unzip -t app/build/outputs/apk/debug/app-debug.apk | tail -n 1
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: AirPlay-TV-debug
-          path: app/build/outputs/apk/debug/*.apk
+          name: AirPlay-TV-Stretch-LowLatency-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
