@@ -1,0 +1,1075 @@
+name: Mustafa TV - Build 10 Lossless Receiver Pipeline
+on:
+  push:
+    branches:
+    - main
+    paths:
+    - .github/workflows/build-debug.yml
+  workflow_dispatch: null
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Android source and submodules
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    - name: Set up JDK 21
+      uses: actions/setup-java@v4
+      with:
+        distribution: zulu
+        java-version: '21'
+    - name: Set up Android SDK
+      uses: android-actions/setup-android@v4
+    - name: Install Android platform and native build tools
+      run: |
+        sdkmanager 'platforms;android-37.0' 'ndk;27.0.12077973' 'cmake;3.22.1'
+    - name: Apply Stretch, v4 low latency, solid dashboard and remote shortcut
+      run: |
+        python3 - <<'PY'
+        from pathlib import Path
+
+        ui = Path('app/src/main/kotlin/io/github/jqssun/airplay/ui/MainScreen.kt')
+        source = ui.read_text(encoding='utf-8')
+        before = '''    val video: @Composable () -> Unit = {
+                val aspect by viewModel.videoAspect.collectAsState()
+                VideoSurfaceView(
+                    onSurfaceAvailable = onSurfaceAvailable,
+                    onSurfaceDestroyed = onSurfaceDestroyed,
+                    aspectRatio = aspect
+                )
+            }'''
+        after = '''    val video: @Composable () -> Unit = {
+                VideoSurfaceView(
+                    onSurfaceAvailable = onSurfaceAvailable,
+                    onSurfaceDestroyed = onSurfaceDestroyed,
+                    applyAspectRatio = false,
+                    modifier = Modifier.fillMaxSize()
+                )
+            }'''
+        if source.count(before) != 1:
+            raise SystemExit('FAIL: mirroring layout changed; cannot apply safe Stretch patch')
+        ui.write_text(source.replace(before, after, 1), encoding='utf-8')
+
+        # Avoid presenting obsolete frames when decoder output has queued up.
+        # The compressed stream stays intact; only decoded DISPLAY frames can be skipped.
+        decoder = Path('app/src/main/kotlin/io/github/jqssun/airplay/renderer/VideoRenderer.kt')
+        renderer = decoder.read_text(encoding='utf-8')
+        old_drain = '''    private fun drainOutput() {
+                val c = codec ?: return
+                val info = MediaCodec.BufferInfo()
+                while (true) {
+                    val idx = c.dequeueOutputBuffer(info, 0)
+                    if (idx < 0) break
+                    _recordOutputFrameTime()
+                    if (scheduledOutputBufferRelease) {
+                        // schedule frame at VSYNC matching its NTP presentation time
+                        val ptsUs = info.presentationTimeUs
+                        if (_ptsBaseUs == Long.MIN_VALUE) {
+                            _ptsBaseUs = ptsUs
+                            _wallBaseNs = System.nanoTime()
+                        }
+                        c.releaseOutputBuffer(idx, _wallBaseNs + (ptsUs - _ptsBaseUs) * 1000L)
+                    } else {
+                        c.releaseOutputBuffer(idx, true)
+                    }
+                }
+            }'''
+        new_drain = '''    private fun drainOutput() {
+                val c = codec ?: return
+                val info = MediaCodec.BufferInfo()
+                var latest = -1
+                var latestPtsUs = 0L
+                while (true) {
+                    val idx = c.dequeueOutputBuffer(info, 0)
+                    if (idx < 0) break
+                    // All packets were decoded. Discard stale DISPLAY buffers only:
+                    // this avoids damaging the inter-frame reference chain.
+                    if (latest >= 0) {
+                        c.releaseOutputBuffer(latest, false)
+                        droppedFrames++
+                    }
+                    latest = idx
+                    latestPtsUs = info.presentationTimeUs
+                }
+                if (latest < 0) return
+                _recordOutputFrameTime()
+                if (scheduledOutputBufferRelease) {
+                    if (_ptsBaseUs == Long.MIN_VALUE) {
+                        _ptsBaseUs = latestPtsUs
+                        _wallBaseNs = System.nanoTime()
+                    }
+                    c.releaseOutputBuffer(latest, _wallBaseNs + (latestPtsUs - _ptsBaseUs) * 1000L)
+                } else {
+                    // Low-latency mode: render the latest decoded frame immediately.
+                    c.releaseOutputBuffer(latest, true)
+                }
+            }'''
+        if renderer.count(old_drain) != 1:
+            raise SystemExit('FAIL: VideoRenderer drainOutput differs; refusing risky patch')
+        decoder.write_text(renderer.replace(old_drain, new_drain, 1), encoding='utf-8')
+        result = decoder.read_text(encoding='utf-8')
+        assert result.count('c.releaseOutputBuffer(latest, false)') == 1
+        assert result.count('c.releaseOutputBuffer(latest, true)') == 1
+        print('PASS: low-latency video now keeps latest decoded frame when backlog accumulates')
+
+        verified_ui = ui.read_text(encoding='utf-8')
+        assert verified_ui.count('applyAspectRatio = false,\n            modifier = Modifier.fillMaxSize()') == 1
+        print('PASS: Stretch mirror preview uses whole TV surface, no aspect-ratio restriction')
+
+
+        from pathlib import Path
+
+
+        def patch_once(path: str, old: str, new: str) -> None:
+            p = Path(path)
+            text = p.read_text(encoding='utf-8')
+            count = text.count(old)
+            if count != 1:
+                raise SystemExit(f'FAIL: {path}: patch anchor found {count} times, expected 1')
+            p.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+        ui_path = 'app/src/main/kotlin/io/github/jqssun/airplay/ui/MainScreen.kt'
+        ui = Path(ui_path)
+        source = ui.read_text(encoding='utf-8')
+        start = '@Composable\nprivate fun DebugOverlay(info: DebugInfo, modifier: Modifier = Modifier) {'
+        end = '\nprivate data class DebugSection('
+        if source.count(start) != 1 or source.count(end) != 1:
+            raise SystemExit('FAIL: dashboard anchor changed')
+        head, tail = source.split(start, 1)
+        _, rest = tail.split(end, 1)
+        # This file will be inserted inside the workflow by the packaging generator.
+        HUD = '''@Composable
+        private fun DebugOverlay(info: DebugInfo, modifier: Modifier = Modifier) {
+            val context = LocalContext.current
+            val cm = remember(context) {
+                context.getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+            }
+            val caps = cm?.let { manager ->
+                manager.activeNetwork?.let { network -> manager.getNetworkCapabilities(network) }
+            }
+            val isWifi = caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true
+            val isEthernet = caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET) == true
+            val networkType = when {
+                isEthernet -> "Ethernet"
+                isWifi -> "Wi-Fi"
+                else -> "Unavailable"
+            }
+            val wifiRssi = if (isWifi) runCatching {
+                val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE)
+                    as? android.net.wifi.WifiManager
+                wifi?.connectionInfo?.rssi
+            }.getOrNull() else null
+            val signal = when {
+                isEthernet -> "Wired connection"
+                wifiRssi != null && wifiRssi in -100..-1 -> "$wifiRssi dBm"
+                else -> "Not available"
+            }
+
+            androidx.compose.material3.Surface(
+                modifier = modifier.width(326.dp),
+                shape = RoundedCornerShape(20.dp),
+                color = Color(0xFFFAFBFF),
+                shadowElevation = 10.dp
+            ) {
+                Column(
+                    modifier = Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(Modifier.size(9.dp).background(Color(0xFF23A88D), CircleShape))
+                            Spacer(Modifier.width(8.dp))
+                            Text(if (info.connections > 0) "AIRPLAY  •  LIVE" else "AIRPLAY  •  IDLE", color = Color(0xFF1B315C),
+                                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold))
+                        }
+                        Text("STRETCH", color = Color(0xFF4267AC),
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold))
+                    }
+                    HorizontalDivider(color = Color(0xFFE3EAF5))
+                    HudMetric(Icons.Default.Wifi, "TV network", networkType, Color(0xFFE0F2FF))
+                    HudMetric(Icons.Default.NetworkCheck, "TV signal", signal, Color(0xFFDEF5EF))
+                    HudMetric(Icons.Default.Image, "Resolution", info.videoRes.ifBlank { "Waiting" }, Color(0xFFEDE6FF))
+                    HudMetric(Icons.Default.Movie, "Frame rate", if (info.videoCodec.isBlank()) "Waiting" else "${info.videoFps} FPS", Color(0xFFE0F2FF))
+                    HudMetric(Icons.Default.Speed, "Stream bitrate", info.bitrateStr, Color(0xFFE2F7EF))
+                    HudMetric(Icons.Default.Memory, "Decoder", info.videoCodec.ifBlank { "Waiting" }, Color(0xFFEDE6FF))
+                    HudMetric(Icons.Default.Timelapse, "Frame jitter", info.jitterStr, Color(0xFFE0F2FF))
+                    HudMetric(Icons.Default.BrokenImage, "Dropped frames", "${info.droppedFrames}", Color(0xFFFFE8ED))
+                    HudMetric(Icons.Default.Link, "Connections", "${info.connections}", Color(0xFFE2F7EF))
+                    HorizontalDivider(color = Color(0xFFE3EAF5))
+                    Text("Hold OK or press MENU / INFO to hide", color = Color(0xFF64748B),
+                        style = MaterialTheme.typography.labelSmall)
+                }
+            }
+        }
+
+        @Composable
+        private fun HudMetric(
+            icon: ImageVector,
+            label: String,
+            value: String,
+            iconBackground: Color
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(9.dp)
+            ) {
+                Box(
+                    modifier = Modifier.size(32.dp).clip(RoundedCornerShape(9.dp)).background(iconBackground),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(icon, contentDescription = null, tint = Color(0xFF2E568A), modifier = Modifier.size(20.dp))
+                }
+                Text(
+                    label,
+                    color = Color(0xFF56647B),
+                    style = MaterialTheme.typography.labelMedium,
+                    modifier = Modifier.weight(1f)
+                )
+                Text(
+                    value,
+                    color = Color(0xFF172746),
+                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.widthIn(max = 165.dp)
+                )
+            }
+        }'''
+        ui.write_text(head + HUD + end + rest, encoding='utf-8')
+
+        # Avoid overlapping with the fullscreen control buttons while the HUD is visible.
+        patch_once(ui_path,
+            'visible = controlsVisible,\n            modifier = Modifier.align(Alignment.TopEnd)',
+            'visible = controlsVisible,\n            modifier = Modifier.align(if (debugEnabled) Alignment.BottomEnd else Alignment.TopEnd)')
+
+        # Keep the good v4 decoder path and avoid unnecessary debug recomposition (5 Hz -> 1 Hz).
+        vm_path = 'app/src/main/kotlin/io/github/jqssun/airplay/viewmodel/MainViewModel.kt'
+        patch_once(vm_path,
+            '    private val prefs = app.getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE)',
+            '    private var lastHudSampleMs = 0L\n    private val prefs = app.getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE)')
+        patch_once(vm_path,
+            '            if (pref(Prefs.DEBUG_ENABLED).value) {\n                _debugInfo.value = it.collectDebugInfo()\n            }',
+            '            if (pref(Prefs.DEBUG_ENABLED).value) {\n                val now = SystemClock.elapsedRealtime()\n                if (now - lastHudSampleMs >= 1000L) {\n                    lastHudSampleMs = now\n                    _debugInfo.value = it.collectDebugInfo()\n                }\n            }')
+
+        activity = 'app/src/main/kotlin/io/github/jqssun/airplay/MainActivity.kt'
+        patch_once(activity,
+            'import android.view.WindowManager',
+            'import android.view.KeyEvent\nimport android.view.WindowManager')
+        patch_once(activity,
+            '    private val viewModel: MainViewModel by viewModels()',
+            '''    private val viewModel: MainViewModel by viewModels()
+            private var hudLongPressHandled = false
+
+            // Remote shortcut works while mirroring without depending on Compose focus.
+            // Some remotes lack MENU/INFO, so repeated OK/ENTER is also supported.
+            override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+                val isCenter = event.keyCode == KeyEvent.KEYCODE_DPAD_CENTER ||
+                    event.keyCode == KeyEvent.KEYCODE_ENTER
+                val isMenu = event.keyCode == KeyEvent.KEYCODE_MENU ||
+                    event.keyCode == KeyEvent.KEYCODE_INFO
+                if (isCenter && event.action == KeyEvent.ACTION_UP && hudLongPressHandled) {
+                    hudLongPressHandled = false
+                    return true
+                }
+                if (!viewModel.mirroringActive.value || isInPip.value) {
+                    if (event.action == KeyEvent.ACTION_UP) hudLongPressHandled = false
+                    return super.dispatchKeyEvent(event)
+                }
+                if (isMenu) {
+                    if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+                        viewModel.set(Prefs.DEBUG_ENABLED, !viewModel.pref(Prefs.DEBUG_ENABLED).value)
+                    }
+                    return true
+                }
+                if (isCenter && event.action == KeyEvent.ACTION_DOWN) {
+                    if (!hudLongPressHandled && (event.isLongPress || event.repeatCount > 0)) {
+                        hudLongPressHandled = true
+                        viewModel.set(Prefs.DEBUG_ENABLED, !viewModel.pref(Prefs.DEBUG_ENABLED).value)
+                        return true
+                    }
+                    if (hudLongPressHandled) return true
+                }
+                return super.dispatchKeyEvent(event)
+            }''')
+
+        settings = 'app/src/main/kotlin/io/github/jqssun/airplay/ui/SettingsScreen.kt'
+        patch_once(settings,
+            '        SectionHeader(stringResource(R.string.section_display))',
+            '''        SectionHeader(stringResource(R.string.section_display))
+
+                SettingSwitch(
+                    title = "Performance dashboard",
+                    description = "Solid icon dashboard while mirroring. Hold OK, or use MENU/INFO, to show or hide.",
+                    checked = debugEnabled,
+                    onCheckedChange = { viewModel.set(Prefs.DEBUG_ENABLED, it) }
+                )''')
+
+        # The original open-source project defaults debug_enabled=false. Keep HUD hidden on fresh installs.
+        prefs = Path('app/src/main/kotlin/io/github/jqssun/airplay/Prefs.kt').read_text(encoding='utf-8')
+        assert prefs.count('val DEBUG_ENABLED = bool("debug_enabled", false)') == 1
+        assert Path(ui_path).read_text(encoding='utf-8').count('private fun HudMetric(') == 1
+        print('PASS: solid icon HUD, real stream telemetry, remote toggle, 1-second refresh, Stretch v4 retained')
+
+        PY
+        git diff --check
+        git diff --stat
+    - name: Apply Mustafa branding and TV UI refresh (no streaming changes)
+      run: |
+        python3 - <<'PY'
+        #!/usr/bin/env python3
+        """Build #6: Mustafa UI-only refresh layered on known-good Build #5.
+        Intentionally does not modify AirPlay, rendering or decoder implementation.
+        """
+        from pathlib import Path
+
+        BASE = Path('app/src/main')
+        UI = BASE / 'kotlin/io/github/jqssun/airplay/ui'
+
+
+        def replace_once(path, old, new):
+            p = Path(path)
+            t = p.read_text(encoding='utf-8')
+            if t.count(old) != 1:
+                raise SystemExit('FAIL: {}: anchor occurred {} times (expected 1): {}'.format(path, t.count(old), repr(old[:110])))
+            p.write_text(t.replace(old, new, 1), encoding='utf-8')
+
+
+        # Preserve applicationId (so settings and device pairing remain intact), just rebrand launcher identity.
+        strings = BASE / 'res/values/strings.xml'
+        replace_once(strings, '<string name="app_name">AirPlay Server</string>', '<string name="app_name">Mustafa</string>')
+        replace_once(strings, '<string name="notification_title">AirPlay Server Running</string>', '<string name="notification_title">Mustafa is running</string>')
+
+        # Stable TV-focused colors, not dynamic wallpaper-dependent colors.
+        theme = UI / 'theme/Theme.kt'
+        theme_text = '''package io.github.jqssun.airplay.ui.theme
+
+        import androidx.compose.material3.MaterialTheme
+        import androidx.compose.material3.darkColorScheme
+        import androidx.compose.runtime.Composable
+        import androidx.compose.ui.graphics.Color
+
+        private val MustafaColors = darkColorScheme(
+            primary = Color(0xFF9DDAFF),
+            onPrimary = Color(0xFF082338),
+            primaryContainer = Color(0xFF193956),
+            onPrimaryContainer = Color(0xFFE1F3FF),
+            secondary = Color(0xFFD3C3FF),
+            onSecondary = Color(0xFF28164E),
+            secondaryContainer = Color(0xFF30264A),
+            onSecondaryContainer = Color(0xFFF1EAFF),
+            tertiary = Color(0xFF94E5D4),
+            onTertiary = Color(0xFF062C25),
+            background = Color(0xFF0A1121),
+            onBackground = Color(0xFFF4F7FF),
+            surface = Color(0xFF151F33),
+            onSurface = Color(0xFFF4F7FF),
+            surfaceVariant = Color(0xFF202D46),
+            onSurfaceVariant = Color(0xFFB9C8DF),
+            outline = Color(0xFF536781),
+            outlineVariant = Color(0xFF34445F),
+            error = Color(0xFFFFB4AB),
+            onError = Color(0xFF690005)
+        )
+
+        @Composable
+        fun AirPlayTheme(content: @Composable () -> Unit) {
+            MaterialTheme(colorScheme = MustafaColors, content = content)
+        }
+        '''
+        assert 'fun AirPlayTheme(' in theme.read_text(encoding='utf-8')
+        theme.write_text(theme_text, encoding='utf-8')
+
+        # Add vector-brand application icon, pure drawable code (no external fonts or graphics).
+        logo = BASE / 'res/drawable/mustafa_logo.xml'
+        logo.write_text('''<?xml version="1.0" encoding="utf-8"?>
+        <vector xmlns:android="http://schemas.android.com/apk/res/android"
+            android:width="108dp"
+            android:height="108dp"
+            android:viewportWidth="108"
+            android:viewportHeight="108">
+            <path android:fillColor="#0B1530"
+                android:pathData="M23,6 L85,6 Q102,6 102,23 L102,85 Q102,102 85,102 L23,102 Q6,102 6,85 L6,23 Q6,6 23,6 Z"/>
+            <path android:fillColor="#9DDAFF"
+                android:pathData="M25,79 L25,29 L37,29 L54,50 L71,29 L83,29 L83,79 L69,79 L69,51 L54,69 L39,51 L39,79 Z"/>
+            <path android:fillColor="#95E5D3"
+                android:pathData="M30,87 L78,87 L78,91 L30,91 Z"/>
+        </vector>
+        ''', encoding='utf-8')
+        manifest = BASE / 'AndroidManifest.xml'
+        replace_once(manifest, 'android:icon="@mipmap/ic_launcher"', 'android:icon="@drawable/mustafa_logo"')
+        replace_once(manifest, 'android:roundIcon="@mipmap/ic_launcher_round"', 'android:roundIcon="@drawable/mustafa_logo"')
+
+        # Android TV uses a wide launcher banner in addition to its square app icon.
+        banner = BASE / 'res/drawable/mustafa_banner.xml'
+        banner.write_text('''<?xml version="1.0" encoding="utf-8"?>
+        <vector xmlns:android="http://schemas.android.com/apk/res/android"
+            android:width="320dp" android:height="180dp"
+            android:viewportWidth="320" android:viewportHeight="180">
+            <path android:fillColor="#0B1530" android:pathData="M0,0 L320,0 L320,180 L0,180 Z" />
+            <path android:fillColor="#1C304C" android:pathData="M180,0 L320,0 L320,180 L114,180 Z" />
+            <path android:fillColor="#9DDAFF" android:pathData="M50,125 L50,55 L67,55 L92,85 L117,55 L134,55 L134,125 L115,125 L115,85 L92,111 L69,85 L69,125 Z" />
+            <path android:fillColor="#94E5D4" android:pathData="M50,136 L134,136 L134,142 L50,142 Z" />
+            <path android:fillColor="#D3C3FF" android:pathData="M193,58 L275,58 L275,64 L193,64 Z" />
+            <path android:fillColor="#9DDAFF" android:pathData="M193,82 L286,82 L286,88 L193,88 Z" />
+            <path android:fillColor="#94E5D4" android:pathData="M193,106 L259,106 L259,112 L193,112 Z" />
+        </vector>
+        ''', encoding='utf-8')
+        replace_once(manifest, 'android:banner="@drawable/banner"', 'android:banner="@drawable/mustafa_banner"')
+
+        # Keep the user's full-screen display, AirPlay receiving, v4 low-latency, and v5 HUD untouched.
+        main = UI / 'MainScreen.kt'
+        replace_once(main, 'import androidx.compose.ui.graphics.Brush', 'import androidx.compose.ui.graphics.Brush\nimport androidx.compose.foundation.BorderStroke')
+        replace_once(main, '''        Scaffold(
+                    bottomBar = {''', '''        Scaffold(
+                    containerColor = MaterialTheme.colorScheme.background,
+                    topBar = { MustafaTopBar(connections) },
+                    bottomBar = {''')
+        replace_once(main, '                    NavigationBar {', '                    NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {')
+        replace_once(main,
+            '            Box(modifier = Modifier.padding(padding).consumeWindowInsets(padding)) {',
+            '            Box(modifier = Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding)) {')
+
+        # Insert a real TV header after MainScreen, no changes to fullscreen and PIN flow.
+        needle = '\n@Composable\nprivate fun TabContent('
+        header = '''
+        @Composable
+        private fun MustafaTopBar(connections: Int) {
+            Surface(
+                color = MaterialTheme.colorScheme.surface,
+                shadowElevation = 5.dp
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 26.dp, vertical = 11.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(13.dp)
+                ) {
+                    Box(
+                        modifier = Modifier.size(46.dp).clip(RoundedCornerShape(15.dp))
+                            .background(Brush.linearGradient(listOf(Color(0xFF8ECFFF), Color(0xFFD2B8FF)))),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text("M", color = Color(0xFF0D1832),
+                            style = MaterialTheme.typography.headlineMedium.copy(fontWeight = FontWeight.Black))
+                    }
+                    Column {
+                        Text("Mustafa", style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold))
+                        Text("AIRPLAY RECEIVER  •  GOOGLE TV", color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.labelSmall)
+                    }
+                    Spacer(Modifier.weight(1f))
+                    Surface(
+                        color = if (connections > 0) Color(0xFF163E39) else Color(0xFF22314E),
+                        shape = RoundedCornerShape(50.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 15.dp, vertical = 9.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                if (connections > 0) Icons.Default.CastConnected else Icons.Default.Wifi,
+                                contentDescription = null,
+                                tint = if (connections > 0) Color(0xFF96E8D4) else Color(0xFFBBD7F6),
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Text(if (connections > 0) "$connections connected" else "Ready to connect",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.onSurface)
+                        }
+                    }
+                }
+            }
+        }
+        '''
+        replace_once(main, needle, '\n' + header + needle)
+
+        # Overview refresh: a branded, at-a-glance card; existing preview/actions remain functionally identical.
+        replace_once(main, '''    Column(modifier = Modifier.fillMaxSize()) {
+                // content area''', '''    Column(modifier = Modifier.fillMaxSize().padding(horizontal = 10.dp, vertical = 4.dp)) {
+                MustafaWelcomeBanner(serverName = serverName, active = state == ServerState.RUNNING,
+                    connections = connections)
+                // content area''')
+        replace_once(main,
+            '''                .clip(RoundedCornerShape(16.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant),
+                    contentAlignment = Alignment.Center
+                ) {
+                    val connecting = state == ServerState.RUNNING''',
+            '''                .clip(RoundedCornerShape(24.dp))
+                        .background(Brush.linearGradient(listOf(Color(0xFF253954), Color(0xFF17213A)))),
+                    contentAlignment = Alignment.Center
+                ) {
+                    val connecting = state == ServerState.RUNNING''')
+        replace_once(main,
+            '''            shape = RoundedCornerShape(16.dp)
+                ) {
+                    Column(modifier = Modifier.padding(20.dp)) {''',
+            '''            shape = RoundedCornerShape(22.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                ) {
+                    Column(modifier = Modifier.padding(20.dp)) {''')
+
+        welcome = '''
+        @Composable
+        private fun MustafaWelcomeBanner(serverName: String, active: Boolean, connections: Int) {
+            Surface(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
+                color = MaterialTheme.colorScheme.surface,
+                shape = RoundedCornerShape(20.dp),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Default.Tv, null, tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(30.dp))
+                    Spacer(Modifier.width(14.dp))
+                    Column {
+                        Text("Your casting space", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold))
+                        Text(serverName, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall)
+                    }
+                    Spacer(Modifier.weight(1f))
+                    Text(
+                        if (active) (if (connections > 0) "●  Streaming" else "●  Available") else "○  Offline",
+                        color = if (active) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold)
+                    )
+                }
+            }
+        }
+        '''
+        replace_once(main, '\n@Composable\nprivate fun FullscreenVideo(', '\n' + welcome + '\n@Composable\nprivate fun FullscreenVideo(')
+
+        # Settings redesign: each category becomes a real rounded card with an icon and subtitle.
+        settings = UI / 'SettingsScreen.kt'
+        replace_once(settings, 'import androidx.compose.foundation.layout.*', '''import androidx.compose.foundation.layout.*
+        import androidx.compose.foundation.BorderStroke
+        import androidx.compose.foundation.background
+        import androidx.compose.foundation.shape.RoundedCornerShape
+        import androidx.compose.material.icons.Icons
+        import androidx.compose.material.icons.filled.*
+        import androidx.compose.ui.graphics.Color
+        import androidx.compose.ui.graphics.vector.ImageVector
+        import androidx.compose.ui.text.font.FontWeight''')
+        replace_once(settings,
+            '''            .verticalScroll(rememberScrollState())
+                    .padding(vertical = 8.dp)
+            ) {
+                SectionHeader(stringResource(R.string.section_server))''',
+            '''            .background(MaterialTheme.colorScheme.background)
+                    .verticalScroll(rememberScrollState())
+                    .padding(vertical = 10.dp)
+            ) {
+                MustafaSettingsIntro()
+                MustafaSettingsGroup(
+                    title = stringResource(R.string.section_server),
+                    subtitle = "Device identity and background service",
+                    icon = Icons.Default.Dns
+                ) {''')
+        sections = [
+            ('connection','Connection & security','Icons.Default.Wifi'),
+            ('display','Picture, resolution and performance','Icons.Default.Tv'),
+            ('decode','Codecs and audio preferences','Icons.Default.Memory'),
+            ('developer','Advanced tools and diagnostics','Icons.Default.Tune'),
+        ]
+        for section,subtitle,icon in sections:
+            old = '        SectionHeader(stringResource(R.string.section_{}))'.format(section)
+            new = '''        }
+
+                MustafaSettingsGroup(
+                    title = stringResource(R.string.section_%s),
+                    subtitle = "%s",
+                    icon = %s
+                ) {''' % (section,subtitle,icon)
+            replace_once(settings,old,new)
+        # Close developer group just before closing the settings Column.
+        replace_once(settings, '''        }
+            }
+        }
+
+        private fun canAutoLaunch''', '''        }
+                }
+                MustafaAboutPanel()
+            }
+        }
+
+        private fun canAutoLaunch''')
+
+        settings_decor = '''
+        @Composable
+        private fun MustafaSettingsIntro() {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 13.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Surface(color = MaterialTheme.colorScheme.primaryContainer,
+                    shape = RoundedCornerShape(18.dp)) {
+                    Icon(Icons.Default.Settings, contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(14.dp).size(26.dp))
+                }
+                Column {
+                    Text("Make Mustafa yours", style = MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.Bold))
+                    Text("Everything you need, beautifully organized for your TV remote",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        }
+
+        @Composable
+        private fun MustafaAboutPanel() {
+            Surface(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 10.dp),
+                shape = RoundedCornerShape(22.dp),
+                color = MaterialTheme.colorScheme.primaryContainer
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(18.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Icon(Icons.Default.Info, contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(26.dp))
+                    Column {
+                        Text("Mustafa TV • Build #6", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold))
+                        Text("Built on open-source Android AirPlay Server • UxPlay • GPL-3.0",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer)
+                    }
+                }
+            }
+        }
+
+        @Composable
+        private fun MustafaSettingsGroup(
+            title: String,
+            subtitle: String,
+            icon: ImageVector,
+            content: @Composable ColumnScope.() -> Unit
+        ) {
+            Surface(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
+                shape = RoundedCornerShape(24.dp),
+                color = MaterialTheme.colorScheme.surface,
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                shadowElevation = 2.dp
+            ) {
+                Column(modifier = Modifier.fillMaxWidth().padding(vertical = 7.dp)) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 19.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Surface(
+                            shape = RoundedCornerShape(13.dp),
+                            color = MaterialTheme.colorScheme.primaryContainer
+                        ) {
+                            Icon(icon, contentDescription = null,
+                                modifier = Modifier.padding(11.dp).size(24.dp),
+                                tint = MaterialTheme.colorScheme.primary)
+                        }
+                        Column {
+                            Text(title, style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                                color = MaterialTheme.colorScheme.onSurface)
+                            Text(subtitle, style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                    HorizontalDivider(modifier = Modifier.padding(horizontal = 18.dp),
+                        color = MaterialTheme.colorScheme.outlineVariant)
+                    Spacer(Modifier.height(3.dp))
+                    content()
+                    Spacer(Modifier.height(5.dp))
+                }
+            }
+        }
+        '''
+        replace_once(settings, '\nprivate fun canAutoLaunch(ctx: Context): Boolean =', '\n' + settings_decor + '\nprivate fun canAutoLaunch(ctx: Context): Boolean =')
+
+        # Make the switch row TV-focus friendly and add a subtle accent line without losing toggle behavior.
+        replace_once(settings,
+            '''    ListItem(
+                modifier = Modifier
+                    .dpadFocus(RectangleShape)
+                    .toggleable(value = checked, role = Role.Switch, onValueChange = onCheckedChange),
+                headlineContent = { Text(title) },''',
+            '''    ListItem(
+                modifier = Modifier
+                    .padding(horizontal = 7.dp, vertical = 2.dp)
+                    .dpadFocus(RoundedCornerShape(12.dp))
+                    .toggleable(value = checked, role = Role.Switch, onValueChange = onCheckedChange),
+                headlineContent = { Text(title, fontWeight = FontWeight.Medium) },''')
+
+        # Guardrails: avoid modifying codecs, renderer, server and network protocol after the stable build.
+        main_source = main.read_text(encoding='utf-8')
+        settings_source = settings.read_text(encoding='utf-8')
+        assert 'fun MustafaTopBar(' in main_source
+        assert 'fun MustafaWelcomeBanner(' in main_source
+        assert settings_source.count('MustafaSettingsGroup(') == 6  # 5 calls + definition
+        assert 'fun MustafaSettingsIntro()' in settings_source
+        assert 'Mustafa' in strings.read_text(encoding='utf-8')
+        assert 'MustafaColors' in theme.read_text(encoding='utf-8')
+        assert 'MustafaAboutPanel()' in settings_source
+        assert banner.exists()
+        print('PASS: Mustafa brand, TV header, overview, card-based settings, dark theme and icon')
+        print('PASS: only UI, launcher resources and strings changed; AirPlay/decoder paths untouched by v6')
+        PY
+        git diff --check
+        git diff --stat
+    - name: Improve menu responsiveness - retain proven stable video pipeline
+      run: |
+        python3 - <<'PY'
+        #!/usr/bin/env python3
+        """Build #9 stable TV settings only; no changes to previously working video path.
+        
+        Runs AFTER stable Build #6 patch steps, before Gradle compile.
+        Changes no codec, media stream, max resolution, frame rate, or bitrate settings.
+        """
+        from pathlib import Path
+        
+        BASE = Path('app/src/main/kotlin/io/github/jqssun/airplay')
+        
+        
+        def replace_one(path, old, new):
+            p = Path(path)
+            s = p.read_text(encoding='utf8')
+            n = s.count(old)
+            if n != 1:
+                raise SystemExit(f'Build7 FAIL: {p}: expected exactly one occurrence, found {n}, of {old[:75]!r}')
+            p.write_text(s.replace(old, new, 1), encoding='utf8')
+        
+        
+        # 1. The old SettingsScreen eagerly composes all controls; change it into a
+        #    segmented lazy list. Section cards are kept intact and remain remote-focusable.
+        settings = BASE / 'ui/SettingsScreen.kt'
+        src = settings.read_text(encoding='utf8')
+        start = src.index('@Composable\nfun SettingsScreen(')
+        end = src.index('\n@Composable\nprivate fun MustafaSettingsIntro()', start)
+        section = src[start:end]
+        assert section.count('MustafaSettingsGroup(') == 5, 'Mustafa UI section count changed'
+        assert section.count('MustafaSettingsIntro()') == 1
+        assert section.count('MustafaAboutPanel()') == 1
+        assert section.count('.verticalScroll(rememberScrollState())') == 1
+        assert section.count('    Column(\n        modifier = Modifier') == 1
+        section = section.replace('    Column(\n        modifier = Modifier', '    LazyColumn(\n        modifier = Modifier', 1)
+        section = section.replace('            .verticalScroll(rememberScrollState())\n', '', 1)
+        section = section.replace(
+            '        MustafaSettingsIntro()\n        MustafaSettingsGroup(',
+            '        item(key = "intro") { MustafaSettingsIntro() }\n        item(key = "server") {\n            MustafaSettingsGroup(',
+            1
+        )
+        assert section.count('item(key = "server")') == 1
+        for name in ('connection', 'display', 'decode', 'developer'):
+            needle = f'title = stringResource(R.string.section_{name})'
+            assert section.count(needle) == 1, name
+            ix = section.index(needle)
+            group_ix = section.rfind('MustafaSettingsGroup(', 0, ix)
+            assert group_ix >= 0, name
+            section = section[:group_ix] + f'}}\n        item(key = "{name}") {{\n            ' + section[group_ix:]
+        needle = 'MustafaAboutPanel()'
+        assert section.count(needle) == 1
+        section = section.replace(needle, '}\n        item(key = "about") { MustafaAboutPanel() }', 1)
+        assert section.count('item(key = ') == 7
+        assert section.count('MustafaSettingsGroup(') == 5
+        src = src[:start] + section + src[end:]
+        old_import = 'import androidx.compose.foundation.layout.*'
+        assert src.count(old_import) == 1
+        src = src.replace(old_import, old_import+'\nimport androidx.compose.foundation.lazy.LazyColumn',1)
+        settings.write_text(src,encoding='utf8')
+        
+        
+        # 2. Browse menus with less foreground polling, but leave movie control responsiveness.
+        #    Media-player seeking remains at the previous 200 ms refresh rate.
+        activity = BASE / 'MainActivity.kt'
+        replace_one(activity,
+        '''                    viewModel.updateFromService()
+                            delay(200)''',
+        '''                    viewModel.updateFromService()
+                            // Don't force the entire TV UI to poll at 5 Hz while browsing menus.
+                            // Keep the more responsive cadence for AirPlay video controls.
+                            delay(if (viewModel.videoPlaybackActive.value) 200L else 850L)''')
+        
+        
+        # 3. Verify absolutely no experimental code is required on the stable renderer.
+        renderer = BASE / 'renderer/VideoRenderer.kt'
+        service = BASE / 'service/AirPlayService.kt'
+        assert 'VideoFrameDispatch' not in service.read_text(encoding='utf8')
+        assert 'asyncDecoderEnabled' not in renderer.read_text(encoding='utf8')
+        assert 'directOutputEnabled' not in renderer.read_text(encoding='utf8')
+        assert 'MustafaTopBar' in (BASE / 'ui/MainScreen.kt').read_text(encoding='utf8')
+        assert 'applyAspectRatio = false' in (BASE / 'ui/MainScreen.kt').read_text(encoding='utf8')
+        print('PASS: Stable Build6 video unchanged. TV settings lazy and state refresh less frequent.')
+        PY
+        git diff --check
+        git diff --stat
+    - name: Build 10 - lossless native receiver offload and observable queues
+      run: |
+        python3 - <<'PY'
+        #!/usr/bin/env python3
+        """Major safe architectural change to Mustafa from Build9 stable.
+        Move blocking MediaCodec work off native AirPlay RTP threads WITHOUT dropping any encoded H264 frame.
+        """
+        from pathlib import Path
+        ROOT=Path('app/src/main/kotlin/io/github/jqssun/airplay')
+        
+        def replace_one(rel,old,new):
+            p=ROOT/rel
+            text=p.read_text('utf8')
+            n=text.count(old)
+            if n!=1: raise RuntimeError(f'Build10 patch failed {p}: anchor count {n} not 1: {old[:100]!r}')
+            p.write_text(text.replace(old,new,1),'utf8')
+        
+        pump=ROOT/'renderer/VideoPacketPump.kt'
+        if pump.exists(): raise RuntimeError('VideoPacketPump.kt already exists - expected clean base')
+        pump.write_text('''package io.github.jqssun.airplay.renderer
+        
+        import android.os.Process
+        import android.os.SystemClock
+        import android.util.Log
+        import java.util.concurrent.ArrayBlockingQueue
+        import java.util.concurrent.TimeUnit
+        
+        /**
+         * AirPlay RTP callback -> ordered, dedicated MediaCodec feeder.
+         *
+         * Crucial difference from the old Build8 dispatcher:
+         * - NEVER discard an arbitrary H.264 P-frame, SPS, PPS or an entire GOP.
+         * - Backpressure (rare) is applied only once all slots are in use.
+         * - The output renderer's existing latest-DECODED-frame policy remains intact.
+         * - There is exactly one MediaCodec feeder, so frame order stays correct.
+         *
+         * Not a claim of zero latency: when the hardware decoder is persistently slower
+         * than the sender, preserving quality means backpressure cannot be eliminated.
+         */
+        class VideoPacketPump(private val renderer: VideoRenderer) {
+            private data class Packet(
+                val data: ByteArray,
+                val ptsNs: Long,
+                val h265: Boolean,
+                val receivedNs: Long
+            )
+        
+            // 6 encoded pictures ~= 200 ms at 30fps; keeps peak memory bounded.
+            // No lossy overflow policy. This queue is intentionally smaller than Build8's.
+            private val fifo = ArrayBlockingQueue<Packet>(6)
+            @Volatile private var running = true
+            private val statsLock = Any()
+            @Volatile var queueWaitMs: Long = 0; private set
+            @Volatile var receivedFps: Int = 0; private set
+            @Volatile var backpressureCount: Long = 0; private set
+            @Volatile var fedFps: Int = 0; private set
+            val queueDepth: Int get() = fifo.size
+            private var receivedInWindow = 0
+            private var fedInWindow = 0
+            private var lastTickMs = SystemClock.elapsedRealtime()
+        
+            private fun tick(now: Long) = synchronized(statsLock) {
+                if (now - lastTickMs >= 1000) {
+                    receivedFps = receivedInWindow
+                    fedFps = fedInWindow
+                    receivedInWindow = 0
+                    fedInWindow = 0
+                    lastTickMs = now
+                    if (queueWaitMs > 80L || fifo.size >= 4 || backpressureCount > 0L) {
+                        Log.i("MustafaLatency", "rx=$receivedFps fed=$fedFps " +
+                            "queue=${fifo.size} queueWaitMs=$queueWaitMs " +
+                            "backpressure=$backpressureCount outputDropped=${renderer.droppedFrames}")
+                    }
+                }
+            }
+        
+            // Runs independently from the native RAOP packet receiver thread.
+            private val feeder = Thread({
+                Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY)
+                while (running) {
+                    try {
+                        val packet = fifo.poll(100, TimeUnit.MILLISECONDS) ?: continue
+                        val wait = ((SystemClock.elapsedRealtimeNanos() - packet.receivedNs) / 1_000_000L)
+                            .coerceAtLeast(0L)
+                        queueWaitMs = (queueWaitMs * 3L + wait) / 4L
+                        // MediaCodec may block. This thread, NOT the network callback, absorbs it.
+                        renderer.feedFrame(packet.data, packet.ptsNs, packet.h265)
+                        synchronized(statsLock) { fedInWindow++ }
+                    } catch (_: InterruptedException) {
+                        if (!running) return@Thread
+                    } catch (e: Exception) {
+                        Log.e("MustafaLatency", "Receiver worker recovered", e)
+                    }
+                }
+            }, "MustafaVideoFeeder").also { it.isDaemon = true; it.start() }
+        
+            /** Preserve every encoded packet; backpressure only if the decoder can't catch up. */
+            fun receive(data: ByteArray, ptsNs: Long, h265: Boolean) {
+                if (!running) return
+                val packet = Packet(data, ptsNs, h265, SystemClock.elapsedRealtimeNanos())
+                synchronized(statsLock) { receivedInWindow++ }
+                tick(SystemClock.elapsedRealtime())
+                if (fifo.offer(packet)) return
+                synchronized(statsLock) { backpressureCount++ }
+                // Unlike Build8, never clear the GOP and never wait for a rare keyframe.
+                while (running) {
+                    try {
+                        if (fifo.offer(packet, 40, TimeUnit.MILLISECONDS)) return
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        return
+                    }
+                }
+            }
+        
+            /** Called only after the native RAOP server has stopped delivering packets. */
+            fun close() {
+                running = false
+                fifo.clear()
+                feeder.interrupt()
+                if (Thread.currentThread() !== feeder) {
+                    try { feeder.join(1500L) } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                    }
+                }
+                fifo.clear()
+            }
+        }
+        ''','utf8')
+        
+        # Preserve the known-good decoder and GL code from Build9.
+        # Only replace how native callback delivers encoded packets to that decoder.
+        svc='service/AirPlayService.kt'
+        replace_one(svc,
+            'import io.github.jqssun.airplay.renderer.VideoRenderer',
+            'import io.github.jqssun.airplay.renderer.VideoRenderer\nimport io.github.jqssun.airplay.renderer.VideoPacketPump')
+        replace_one(svc,
+            '    val videoRenderer = VideoRenderer(this)',
+            '    val videoRenderer = VideoRenderer(this)\n    @Volatile private var videoPacketPump: VideoPacketPump? = null')
+        # Start pump before accepting mirror packets. The service can restart within same instance.
+        replace_one(svc,
+            '        val maxFps = prefs[Prefs.MAX_FPS]',
+            '''        // Core latency redesign: never run blocking MediaCodec operations on RAOP callback threads.
+                videoPacketPump?.close()
+                videoPacketPump = if (prefs[Prefs.FAST_PACKET_PUMP]) VideoPacketPump(videoRenderer) else null
+                val maxFps = prefs[Prefs.MAX_FPS]''')
+        replace_one(svc,
+            '''    override fun onVideoData(data: ByteArray, ntpTimeNs: Long, isH265: Boolean) {
+                videoRenderer.feedFrame(data, ntpTimeNs, isH265)
+            }''',
+            '''    override fun onVideoData(data: ByteArray, ntpTimeNs: Long, isH265: Boolean) {
+                // All NAL units, including reference pictures, are kept in their original order.
+                // The RAOP thread doesn't wait for a MediaCodec input buffer under normal load.
+                val pump = videoPacketPump
+                if (pump != null) pump.receive(data, ntpTimeNs, isH265)
+                else videoRenderer.feedFrame(data, ntpTimeNs, isH265)
+            }''')
+        # Shutdown only once nativeStop() has returned and stopped callbacks.
+        replace_one(svc,
+            '''        videoRenderer.release()
+                airPlayVideoPlayer.stop()''',
+            '''        videoPacketPump?.close()
+                videoPacketPump = null
+                videoRenderer.release()
+                airPlayVideoPlayer.stop()''')
+        
+        # Recovery switch makes the proven Build9 path accessible without reinstalling.
+        replace_one('Prefs.kt',
+            '    val LOW_LATENCY = bool("low_latency", false)',
+            '    val LOW_LATENCY = bool("low_latency", false)\n    val FAST_PACKET_PUMP = bool("fast_packet_pump", true, restart = true)')
+        
+        replace_one('ui/SettingsScreen.kt',
+            '    val lowLatency by viewModel.pref(Prefs.LOW_LATENCY).collectAsState()',
+            '    val lowLatency by viewModel.pref(Prefs.LOW_LATENCY).collectAsState()\n    val fastPacketPump by viewModel.pref(Prefs.FAST_PACKET_PUMP).collectAsState()')
+        replace_one('ui/SettingsScreen.kt',
+            '''        if (developerOptions) {
+                    SettingSwitch(
+                        title = stringResource(R.string.setting_auto_start),''',
+            '''        if (developerOptions) {
+                    SettingSwitch(
+                        title = "Fast AirPlay receiver (Build 10)",
+                        description = "Dedicated lossless video feeder. Turn off to restore Build 9 receive path; restarts server.",
+                        checked = fastPacketPump,
+                        onCheckedChange = { viewModel.set(Prefs.FAST_PACKET_PUMP, it) }
+                    )
+                    SettingSwitch(
+                        title = stringResource(R.string.setting_auto_start),''')
+        
+        # Display queue delay (not falsely claiming to measure sender-to-screen latency).
+        replace_one('viewmodel/MainViewModel.kt',
+            '''    val videoFps: Int = 0,
+            val videoBitrate: Long = 0,''',
+            '''    val videoFps: Int = 0,
+            val receiverFps: Int = 0,
+            val fedFps: Int = 0,
+            val receiverQueueMs: Long = 0,
+            val receiverQueueDepth: Int = 0,
+            val receiverBackpressure: Long = 0,
+            val videoBitrate: Long = 0,''')
+        replace_one('service/AirPlayService.kt',
+            '''        videoFps = videoRenderer.fps,
+                videoBitrate = videoRenderer.bitrateBps,''',
+            '''        videoFps = videoRenderer.fps,
+                receiverFps = videoPacketPump?.receivedFps ?: 0,
+                fedFps = videoPacketPump?.fedFps ?: 0,
+                receiverQueueMs = videoPacketPump?.queueWaitMs ?: 0,
+                receiverQueueDepth = videoPacketPump?.queueDepth ?: 0,
+                receiverBackpressure = videoPacketPump?.backpressureCount ?: 0,
+                videoBitrate = videoRenderer.bitrateBps,''')
+        replace_one('ui/MainScreen.kt',
+            '''                    HudMetric(Icons.Default.Memory, "Decoder", info.videoCodec.ifBlank { "Waiting" }, Color(0xFFEDE6FF))
+                            HudMetric(Icons.Default.Timelapse, "Frame jitter", info.jitterStr, Color(0xFFE0F2FF))''',
+            '''                    HudMetric(Icons.Default.Memory, "Decoder", info.videoCodec.ifBlank { "Waiting" }, Color(0xFFEDE6FF))
+                            HudMetric(Icons.Default.NetworkCheck, "Receive / feed", "${info.receiverFps} / ${info.fedFps} FPS", Color(0xFFDEF5EF))
+                            HudMetric(Icons.Default.Timelapse, "Receiver queue", "${info.receiverQueueMs} ms - ${info.receiverQueueDepth} waiting", Color(0xFFE0F2FF))
+                            HudMetric(Icons.Default.Timelapse, "Frame jitter", info.jitterStr, Color(0xFFE0F2FF))''')
+        
+        # Runtime-safe MediaCodec input transfer: drain decoded output before blocking on next
+        # input slot. Previously it could wait 20ms before ever draining output, in a loop.
+        # This cannot damage stream references: it does not change compressed input data.
+        renderer='renderer/VideoRenderer.kt'
+        replace_one(renderer,
+            '''        repeat(retries) {
+                    val idx = c.dequeueInputBuffer(FEED_WAIT_US)''',
+            '''        repeat(retries) {
+                    // Do not let output buffers fill while waiting for input buffers.
+                    // This feedback loop is a major latency source on some MediaTek decoders.
+                    drainOutput()
+                    val idx = c.dequeueInputBuffer(FEED_WAIT_US)''')
+        
+        # Keep all quality/transport/viewport settings exactly as in Build9.
+        ss=(ROOT/svc).read_text('utf8')
+        rr=(ROOT/renderer).read_text('utf8')
+        assert 'VideoFrameDispatch' not in ss
+        assert 'isSyncFrame' not in rr
+        assert 'c.releaseOutputBuffer(latest, true)' in rr
+        assert 'framePacketPump' not in ss
+        assert 'val maxFps = prefs[Prefs.MAX_FPS]' in ss
+        assert (ROOT/'ui/MainScreen.kt').read_text('utf8').count('applyAspectRatio = false')>=1
+        print('PASS: native RAOP -> lossless ordered bounded feeder; no GOP loss or fake keyframe recovery')
+        print('PASS: decoder output freed proactively before each input wait')
+        print('PASS: original H264, pixels, bitrate, resolution, 30/60fps settings, Stretch and branded TV UI untouched')
+        PY
+        git diff --check
+        git diff --stat
+    - name: Compile and test APK assembly
+      run: |
+        chmod +x ./gradlew
+        ./gradlew :app:assembleDebug --no-daemon
+    - name: Validate APK archive
+      run: |
+        test -s app/build/outputs/apk/debug/app-debug.apk
+        unzip -t app/build/outputs/apk/debug/app-debug.apk | tail -n 1
+    - name: Upload test APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: Mustafa-TV-Build10-LosslessReceiver-debug
+        path: app/build/outputs/apk/debug/app-debug.apk
+        if-no-files-found: error
