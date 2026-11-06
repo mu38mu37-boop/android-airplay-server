@@ -1,4 +1,4 @@
-name: Mustafa TV - Build 10 Lossless Receiver Pipeline
+name: Mustafa TV - Build 10 Fixed HUD and Lossless Receiver
 on:
   push:
     branches:
@@ -1024,12 +1024,12 @@ jobs:
                 receiverBackpressure = videoPacketPump?.backpressureCount ?: 0,
                 videoBitrate = videoRenderer.bitrateBps,''')
         replace_one('ui/MainScreen.kt',
-            '''                    HudMetric(Icons.Default.Memory, "Decoder", info.videoCodec.ifBlank { "Waiting" }, Color(0xFFEDE6FF))
-                            HudMetric(Icons.Default.Timelapse, "Frame jitter", info.jitterStr, Color(0xFFE0F2FF))''',
-            '''                    HudMetric(Icons.Default.Memory, "Decoder", info.videoCodec.ifBlank { "Waiting" }, Color(0xFFEDE6FF))
-                            HudMetric(Icons.Default.NetworkCheck, "Receive / feed", "${info.receiverFps} / ${info.fedFps} FPS", Color(0xFFDEF5EF))
-                            HudMetric(Icons.Default.Timelapse, "Receiver queue", "${info.receiverQueueMs} ms - ${info.receiverQueueDepth} waiting", Color(0xFFE0F2FF))
-                            HudMetric(Icons.Default.Timelapse, "Frame jitter", info.jitterStr, Color(0xFFE0F2FF))''')
+            '''            HudMetric(Icons.Default.Memory, "Decoder", info.videoCodec.ifBlank { "Waiting" }, Color(0xFFEDE6FF))
+                    HudMetric(Icons.Default.Timelapse, "Frame jitter", info.jitterStr, Color(0xFFE0F2FF))''',
+            '''            HudMetric(Icons.Default.Memory, "Decoder", info.videoCodec.ifBlank { "Waiting" }, Color(0xFFEDE6FF))
+                    HudMetric(Icons.Default.NetworkCheck, "Receive / feed", "${info.receiverFps} / ${info.fedFps} FPS", Color(0xFFDEF5EF))
+                    HudMetric(Icons.Default.Timelapse, "Receiver queue", "${info.receiverQueueMs} ms - ${info.receiverQueueDepth} waiting", Color(0xFFE0F2FF))
+                    HudMetric(Icons.Default.Timelapse, "Frame jitter", info.jitterStr, Color(0xFFE0F2FF))''')
         
         # Runtime-safe MediaCodec input transfer: drain decoded output before blocking on next
         # input slot. Previously it could wait 20ms before ever draining output, in a loop.
