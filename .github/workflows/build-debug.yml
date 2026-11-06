@@ -1,4 +1,4 @@
-name: AirPlay TV - Stretch + Low Latency Debug APK
+name: AirPlay TV - Stretch Low Latency + Visual HUD
 
 on:
   push:
@@ -14,12 +14,12 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout sources and native submodules
+      - name: Checkout Android source and submodules
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Set up Java 21
+      - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           distribution: zulu
@@ -28,11 +28,11 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Install required Android SDK and native tools
+      - name: Install Android platform and native build tools
         run: |
           sdkmanager 'platforms;android-37.0' 'ndk;27.0.12077973' 'cmake;3.22.1'
 
-      - name: Apply Stretch and decoded-frame latency optimization
+      - name: Apply Stretch, v4 low latency, solid dashboard and remote shortcut
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -58,14 +58,6 @@ jobs:
           if source.count(before) != 1:
               raise SystemExit('FAIL: mirroring layout changed; cannot apply safe Stretch patch')
           ui.write_text(source.replace(before, after, 1), encoding='utf-8')
-
-          prefs = Path('app/src/main/kotlin/io/github/jqssun/airplay/Prefs.kt')
-          source = prefs.read_text(encoding='utf-8')
-          debug_old = 'val DEBUG_ENABLED = bool("debug_enabled", false)'
-          debug_new = 'val DEBUG_ENABLED = bool("debug_enabled", true)'
-          if source.count(debug_old) != 1:
-              raise SystemExit('FAIL: debug setting changed; cannot enable diagnostic overlay')
-          prefs.write_text(source.replace(debug_old, debug_new, 1), encoding='utf-8')
 
           # Avoid presenting obsolete frames when decoder output has queued up.
           # The compressed stream stays intact; only decoded DISPLAY frames can be skipped.
@@ -131,26 +123,224 @@ jobs:
 
           verified_ui = ui.read_text(encoding='utf-8')
           assert verified_ui.count('applyAspectRatio = false,\n            modifier = Modifier.fillMaxSize()') == 1
-          assert prefs.read_text(encoding='utf-8').count(debug_new) == 1
           print('PASS: Stretch mirror preview uses whole TV surface, no aspect-ratio restriction')
-          print('PASS: Debug overlay enabled by default for new installations')
+
+
+          from pathlib import Path
+
+
+          def patch_once(path: str, old: str, new: str) -> None:
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'FAIL: {path}: patch anchor found {count} times, expected 1')
+              p.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          ui_path = 'app/src/main/kotlin/io/github/jqssun/airplay/ui/MainScreen.kt'
+          ui = Path(ui_path)
+          source = ui.read_text(encoding='utf-8')
+          start = '@Composable\nprivate fun DebugOverlay(info: DebugInfo, modifier: Modifier = Modifier) {'
+          end = '\nprivate data class DebugSection('
+          if source.count(start) != 1 or source.count(end) != 1:
+              raise SystemExit('FAIL: dashboard anchor changed')
+          head, tail = source.split(start, 1)
+          _, rest = tail.split(end, 1)
+          # This file will be inserted inside the workflow by the packaging generator.
+          HUD = '''@Composable
+          private fun DebugOverlay(info: DebugInfo, modifier: Modifier = Modifier) {
+              val context = LocalContext.current
+              val cm = remember(context) {
+                  context.getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+              }
+              val caps = cm?.let { manager ->
+                  manager.activeNetwork?.let { network -> manager.getNetworkCapabilities(network) }
+              }
+              val isWifi = caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true
+              val isEthernet = caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET) == true
+              val networkType = when {
+                  isEthernet -> "Ethernet"
+                  isWifi -> "Wi-Fi"
+                  else -> "Unavailable"
+              }
+              val wifiRssi = if (isWifi) runCatching {
+                  val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE)
+                      as? android.net.wifi.WifiManager
+                  wifi?.connectionInfo?.rssi
+              }.getOrNull() else null
+              val signal = when {
+                  isEthernet -> "Wired connection"
+                  wifiRssi != null && wifiRssi in -100..-1 -> "$wifiRssi dBm"
+                  else -> "Not available"
+              }
+
+              androidx.compose.material3.Surface(
+                  modifier = modifier.width(326.dp),
+                  shape = RoundedCornerShape(20.dp),
+                  color = Color(0xFFFAFBFF),
+                  shadowElevation = 10.dp
+              ) {
+                  Column(
+                      modifier = Modifier.padding(14.dp),
+                      verticalArrangement = Arrangement.spacedBy(8.dp)
+                  ) {
+                      Row(
+                          modifier = Modifier.fillMaxWidth(),
+                          verticalAlignment = Alignment.CenterVertically,
+                          horizontalArrangement = Arrangement.SpaceBetween
+                      ) {
+                          Row(verticalAlignment = Alignment.CenterVertically) {
+                              Box(Modifier.size(9.dp).background(Color(0xFF23A88D), CircleShape))
+                              Spacer(Modifier.width(8.dp))
+                              Text(if (info.connections > 0) "AIRPLAY  •  LIVE" else "AIRPLAY  •  IDLE", color = Color(0xFF1B315C),
+                                  style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold))
+                          }
+                          Text("STRETCH", color = Color(0xFF4267AC),
+                              style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold))
+                      }
+                      HorizontalDivider(color = Color(0xFFE3EAF5))
+                      HudMetric(Icons.Default.Wifi, "TV network", networkType, Color(0xFFE0F2FF))
+                      HudMetric(Icons.Default.NetworkCheck, "TV signal", signal, Color(0xFFDEF5EF))
+                      HudMetric(Icons.Default.Image, "Resolution", info.videoRes.ifBlank { "Waiting" }, Color(0xFFEDE6FF))
+                      HudMetric(Icons.Default.Movie, "Frame rate", if (info.videoCodec.isBlank()) "Waiting" else "${info.videoFps} FPS", Color(0xFFE0F2FF))
+                      HudMetric(Icons.Default.Speed, "Stream bitrate", info.bitrateStr, Color(0xFFE2F7EF))
+                      HudMetric(Icons.Default.Memory, "Decoder", info.videoCodec.ifBlank { "Waiting" }, Color(0xFFEDE6FF))
+                      HudMetric(Icons.Default.Timelapse, "Frame jitter", info.jitterStr, Color(0xFFE0F2FF))
+                      HudMetric(Icons.Default.BrokenImage, "Dropped frames", "${info.droppedFrames}", Color(0xFFFFE8ED))
+                      HudMetric(Icons.Default.Link, "Connections", "${info.connections}", Color(0xFFE2F7EF))
+                      HorizontalDivider(color = Color(0xFFE3EAF5))
+                      Text("Hold OK or press MENU / INFO to hide", color = Color(0xFF64748B),
+                          style = MaterialTheme.typography.labelSmall)
+                  }
+              }
+          }
+
+          @Composable
+          private fun HudMetric(
+              icon: ImageVector,
+              label: String,
+              value: String,
+              iconBackground: Color
+          ) {
+              Row(
+                  modifier = Modifier.fillMaxWidth(),
+                  verticalAlignment = Alignment.CenterVertically,
+                  horizontalArrangement = Arrangement.spacedBy(9.dp)
+              ) {
+                  Box(
+                      modifier = Modifier.size(32.dp).clip(RoundedCornerShape(9.dp)).background(iconBackground),
+                      contentAlignment = Alignment.Center
+                  ) {
+                      Icon(icon, contentDescription = null, tint = Color(0xFF2E568A), modifier = Modifier.size(20.dp))
+                  }
+                  Text(
+                      label,
+                      color = Color(0xFF56647B),
+                      style = MaterialTheme.typography.labelMedium,
+                      modifier = Modifier.weight(1f)
+                  )
+                  Text(
+                      value,
+                      color = Color(0xFF172746),
+                      style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                      maxLines = 1,
+                      overflow = TextOverflow.Ellipsis,
+                      modifier = Modifier.widthIn(max = 165.dp)
+                  )
+              }
+          }'''
+          ui.write_text(head + HUD + end + rest, encoding='utf-8')
+
+          # Avoid overlapping with the fullscreen control buttons while the HUD is visible.
+          patch_once(ui_path,
+              'visible = controlsVisible,\n            modifier = Modifier.align(Alignment.TopEnd)',
+              'visible = controlsVisible,\n            modifier = Modifier.align(if (debugEnabled) Alignment.BottomEnd else Alignment.TopEnd)')
+
+          # Keep the good v4 decoder path and avoid unnecessary debug recomposition (5 Hz -> 1 Hz).
+          vm_path = 'app/src/main/kotlin/io/github/jqssun/airplay/viewmodel/MainViewModel.kt'
+          patch_once(vm_path,
+              '    private val prefs = app.getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE)',
+              '    private var lastHudSampleMs = 0L\n    private val prefs = app.getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE)')
+          patch_once(vm_path,
+              '            if (pref(Prefs.DEBUG_ENABLED).value) {\n                _debugInfo.value = it.collectDebugInfo()\n            }',
+              '            if (pref(Prefs.DEBUG_ENABLED).value) {\n                val now = SystemClock.elapsedRealtime()\n                if (now - lastHudSampleMs >= 1000L) {\n                    lastHudSampleMs = now\n                    _debugInfo.value = it.collectDebugInfo()\n                }\n            }')
+
+          activity = 'app/src/main/kotlin/io/github/jqssun/airplay/MainActivity.kt'
+          patch_once(activity,
+              'import android.view.WindowManager',
+              'import android.view.KeyEvent\nimport android.view.WindowManager')
+          patch_once(activity,
+              '    private val viewModel: MainViewModel by viewModels()',
+              '''    private val viewModel: MainViewModel by viewModels()
+              private var hudLongPressHandled = false
+
+              // Remote shortcut works while mirroring without depending on Compose focus.
+              // Some remotes lack MENU/INFO, so repeated OK/ENTER is also supported.
+              override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+                  val isCenter = event.keyCode == KeyEvent.KEYCODE_DPAD_CENTER ||
+                      event.keyCode == KeyEvent.KEYCODE_ENTER
+                  val isMenu = event.keyCode == KeyEvent.KEYCODE_MENU ||
+                      event.keyCode == KeyEvent.KEYCODE_INFO
+                  if (isCenter && event.action == KeyEvent.ACTION_UP && hudLongPressHandled) {
+                      hudLongPressHandled = false
+                      return true
+                  }
+                  if (!viewModel.mirroringActive.value || isInPip.value) {
+                      if (event.action == KeyEvent.ACTION_UP) hudLongPressHandled = false
+                      return super.dispatchKeyEvent(event)
+                  }
+                  if (isMenu) {
+                      if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+                          viewModel.set(Prefs.DEBUG_ENABLED, !viewModel.pref(Prefs.DEBUG_ENABLED).value)
+                      }
+                      return true
+                  }
+                  if (isCenter && event.action == KeyEvent.ACTION_DOWN) {
+                      if (!hudLongPressHandled && (event.isLongPress || event.repeatCount > 0)) {
+                          hudLongPressHandled = true
+                          viewModel.set(Prefs.DEBUG_ENABLED, !viewModel.pref(Prefs.DEBUG_ENABLED).value)
+                          return true
+                      }
+                      if (hudLongPressHandled) return true
+                  }
+                  return super.dispatchKeyEvent(event)
+              }''')
+
+          settings = 'app/src/main/kotlin/io/github/jqssun/airplay/ui/SettingsScreen.kt'
+          patch_once(settings,
+              '        SectionHeader(stringResource(R.string.section_display))',
+              '''        SectionHeader(stringResource(R.string.section_display))
+
+                  SettingSwitch(
+                      title = "Performance dashboard",
+                      description = "Solid icon dashboard while mirroring. Hold OK, or use MENU/INFO, to show or hide.",
+                      checked = debugEnabled,
+                      onCheckedChange = { viewModel.set(Prefs.DEBUG_ENABLED, it) }
+                  )''')
+
+          # The original open-source project defaults debug_enabled=false. Keep HUD hidden on fresh installs.
+          prefs = Path('app/src/main/kotlin/io/github/jqssun/airplay/Prefs.kt').read_text(encoding='utf-8')
+          assert prefs.count('val DEBUG_ENABLED = bool("debug_enabled", false)') == 1
+          assert Path(ui_path).read_text(encoding='utf-8').count('private fun HudMetric(') == 1
+          print('PASS: solid icon HUD, real stream telemetry, remote toggle, 1-second refresh, Stretch v4 retained')
+
           PY
           git diff --check
           git diff --stat
 
-      - name: Build APK
+      - name: Compile and test APK assembly
         run: |
           chmod +x ./gradlew
           ./gradlew :app:assembleDebug --no-daemon
 
-      - name: Validate generated APK
+      - name: Validate APK archive
         run: |
           test -s app/build/outputs/apk/debug/app-debug.apk
           unzip -t app/build/outputs/apk/debug/app-debug.apk | tail -n 1
 
-      - name: Upload APK
+      - name: Upload test APK
         uses: actions/upload-artifact@v4
         with:
-          name: AirPlay-TV-Stretch-LowLatency-debug
+          name: AirPlay-TV-VisualHUD-LowLatency-debug
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
