@@ -1,4 +1,4 @@
-name: Mustafa TV - Build 10 Fixed HUD and Lossless Receiver
+name: Mustafa TV - Build 11 Latency Tracing (Diagnostic Only)
 on:
   push:
     branches:
@@ -1059,6 +1059,194 @@ jobs:
         PY
         git diff --check
         git diff --stat
+    - name: Add Build 11 diagnostics only - preserve video pipeline
+      run: |
+        python3 - <<'PY'
+        from pathlib import Path
+        import re
+
+        # Build 11: diagnosis ONLY. Preserve the complete Build 10 video behavior.
+        ROOT = Path('app/src/main/kotlin/io/github/jqssun/airplay')
+
+        def patch(path, before, after):
+            p = ROOT / path
+            src = p.read_text(encoding='utf-8')
+            n = src.count(before)
+            if n != 1:
+                raise RuntimeError(f'Build11 diagnostic anchor failed in {p}: {n} matches for {before[:100]!r}')
+            p.write_text(src.replace(before, after, 1), encoding='utf-8')
+
+        def patch_regex(path, pat, replacement):
+            p = ROOT / path
+            s = p.read_text(encoding='utf-8')
+            next_s, n = re.subn(pat, replacement, s, count=1, flags=re.MULTILINE)
+            if n != 1:
+                raise RuntimeError(f'Build11 diagnostic regex missing in {path}: {pat!r}')
+            p.write_text(next_s, encoding='utf-8')
+
+        renderer='renderer/VideoRenderer.kt'
+        pipeline='renderer/VideoPipeline.kt'
+        service='service/AirPlayService.kt'
+        viewmodel='viewmodel/MainViewModel.kt'
+        ui='ui/MainScreen.kt'
+
+        # 1. One monotonic clock for internal stage durations. Source PTS is a separate
+        # clock and may be invalid unless sender/receiver NTP mapping is sane.
+        patch(renderer, '    private val pipeline = VideoPipeline()', '''    private val pipeline = VideoPipeline()
+            // Diagnostic-only. The map is accessed exclusively by the existing renderer lock.
+            private val queuedAtNs = LinkedHashMap<Long, Long>()
+            @Volatile var rxPtsAgeMs = -1L; private set
+            @Volatile var codecPtsAgeMs = -1L; private set
+            @Volatile var glPtsAgeMs = -1L; private set
+            @Volatile var decoderResidenceMs = -1L; private set
+            @Volatile var glSubmitMs = -1L; private set
+            @Volatile var outputFrameCount = 0L; private set
+            @Volatile var glFrameCount = 0L; private set
+
+            // The incoming RTP NTP time is converted to the receiver's wall clock by UxPlay.
+            // Reject impossible ages instead of reporting a misleading huge delay.
+            private fun ptsAgeMs(ptsNs: Long): Long {
+                if (ptsNs <= 0L) return -1L
+                val age = System.currentTimeMillis() - ptsNs / 1_000_000L
+                return if (age in -500L..30_000L) age else -1L
+            }
+
+            fun noteFrameReceived(ptsNs: Long) {
+                rxPtsAgeMs = ptsAgeMs(ptsNs)
+            }
+
+            init {
+                // Callback fires AFTER EGL swap returns, not when photons hit the panel.
+                pipeline.onFrameDiagnostic = { presentationTimeNs, swapDurationMs ->
+                    glFrameCount++
+                    glSubmitMs = swapDurationMs
+                    glPtsAgeMs = ptsAgeMs(presentationTimeNs)
+                }
+            }''')
+
+        patch(renderer,
+              '        fps = 0; bitrateBps = 0; frameCount = 0; codecName = ""',
+              '''        fps = 0; bitrateBps = 0; frameCount = 0; codecName = ""
+                rxPtsAgeMs = -1L; codecPtsAgeMs = -1L; glPtsAgeMs = -1L
+                decoderResidenceMs = -1L; glSubmitMs = -1L
+                outputFrameCount = 0L; glFrameCount = 0L''')
+
+        patch(renderer, '                c.queueInputBuffer(idx, 0, data.size, ntpTimeNs / 1000, 0)\n                firstFrameQueued = true',
+            '''                val ptsUs = ntpTimeNs / 1000L
+                        c.queueInputBuffer(idx, 0, data.size, ptsUs, 0)
+                        queuedAtNs[ptsUs] = System.nanoTime()
+                        // Bound trace bookkeeping under unusual timestamp/codec behavior.
+                        if (queuedAtNs.size > 256) queuedAtNs.remove(queuedAtNs.keys.first())
+                        firstFrameQueued = true''')
+
+        patch(renderer,
+              '        _ptsBaseUs = Long.MIN_VALUE\n        _wallBaseNs = 0L\n        codec?.let {',
+              '''        _ptsBaseUs = Long.MIN_VALUE
+                _wallBaseNs = 0L
+                queuedAtNs.clear()
+                codec?.let {''')
+
+        patch(renderer,
+              '            if (idx < 0) break\n            // All packets were decoded. Discard stale DISPLAY buffers only:',
+              '''            if (idx < 0) break
+                    // Diagnostic only: no changes to which frames are rendered or dropped.
+                    outputFrameCount++
+                    val nowNs = System.nanoTime()
+                    val inputNs = queuedAtNs.remove(info.presentationTimeUs)
+                    if (inputNs != null) {
+                        decoderResidenceMs = ((nowNs - inputNs) / 1_000_000L).coerceAtLeast(0L)
+                    }
+                    codecPtsAgeMs = ptsAgeMs(info.presentationTimeUs * 1000L)
+                    // All packets were decoded. Discard stale DISPLAY buffers only:''')
+
+        # 2. Timestamp the SurfaceTexture actually consumed, then the EGL swap.
+        # No new GL operations: uses the existing SurfaceTexture timestamp and clock.
+        patch(pipeline,
+              '    @Volatile private var frameAvailable = false',
+              '''    @Volatile var onFrameDiagnostic: ((Long, Long) -> Unit)? = null
+            @Volatile private var frameAvailable = false''')
+        patch(pipeline,
+              '''        st.getTransformMatrix(texMatrix)
+                hasFrame = true
+                _render()''',
+              '''        st.getTransformMatrix(texMatrix)
+                val presentationTimeNs = st.timestamp
+                hasFrame = true
+                val beforeSwapNs = System.nanoTime()
+                _render()
+                onFrameDiagnostic?.invoke(presentationTimeNs,
+                    ((System.nanoTime() - beforeSwapNs) / 1_000_000L).coerceAtLeast(0L))''')
+
+        # 3. Timestamp frames on the receiver's native JNI callback entry. The
+        # original codec data, PTS and all NAL units remain byte-for-byte unchanged.
+        patch(service,
+              '''    override fun onVideoData(data: ByteArray, ntpTimeNs: Long, isH265: Boolean) {
+                // All NAL units, including reference pictures, are kept in their original order.''',
+              '''    override fun onVideoData(data: ByteArray, ntpTimeNs: Long, isH265: Boolean) {
+                videoRenderer.noteFrameReceived(ntpTimeNs)
+                // All NAL units, including reference pictures, are kept in their original order.''')
+
+        # 4. Surface the distinct stage measurements, so users can share one HUD photo.
+        patch(viewmodel,
+              '    val receiverQueueDepth: Int = 0,',
+              '''    val receiverQueueDepth: Int = 0,
+            val rxPtsAgeMs: Long = -1L,
+            val codecPtsAgeMs: Long = -1L,
+            val glPtsAgeMs: Long = -1L,
+            val decoderResidenceMs: Long = -1L,
+            val glSubmitMs: Long = -1L,
+            val codecFrames: Long = 0L,
+            val glFrames: Long = 0L,''')
+        patch(service,
+              '        receiverQueueDepth = videoPacketPump?.queueDepth ?: 0,',
+              '''        receiverQueueDepth = videoPacketPump?.queueDepth ?: 0,
+                rxPtsAgeMs = videoRenderer.rxPtsAgeMs,
+                codecPtsAgeMs = videoRenderer.codecPtsAgeMs,
+                glPtsAgeMs = videoRenderer.glPtsAgeMs,
+                decoderResidenceMs = videoRenderer.decoderResidenceMs,
+                glSubmitMs = videoRenderer.glSubmitMs,
+                codecFrames = videoRenderer.outputFrameCount,
+                glFrames = videoRenderer.glFrameCount,''')
+
+        # Append rather than replace the known-good dashboard. No changes to its
+        # visibility, surface or layout sizing logic.
+        hud = (ROOT / ui).read_text(encoding='utf-8')
+        pat = r'(?m)^([ \t]*)HudMetric\(Icons.Default.Timelapse, "Receiver queue", [^\n]*$'
+        matches = list(re.finditer(pat, hud))
+        if len(matches) != 1:
+            raise RuntimeError(f'Build11 HUD anchor found {len(matches)} times, expected 1')
+        m = matches[0]
+        indent = m.group(1)
+        new_rows = [
+            'HudMetric(Icons.Default.Timelapse, "RX PTS age", if (info.rxPtsAgeMs >= 0) "${info.rxPtsAgeMs} ms" else "n/a", Color(0xFFE0F2FF))',
+            'HudMetric(Icons.Default.Timelapse, "Codec / GL age", "${info.codecPtsAgeMs} / ${info.glPtsAgeMs} ms", Color(0xFFE0F2FF))',
+            'HudMetric(Icons.Default.Memory, "Decode / GL time", "${info.decoderResidenceMs} / ${info.glSubmitMs} ms", Color(0xFFEDE6FF))',
+            'HudMetric(Icons.Default.Movie, "Codec / GL frames", "${info.codecFrames} / ${info.glFrames}", Color(0xFFDEF5EF))',
+        ]
+        insert_at = m.end()
+        hud = hud[:insert_at] + ''.join('\n' + indent + row for row in new_rows) + hud[insert_at:]
+        # Keep the diagnostic panel the SAME height as Build10's overlay. Four
+        # general-purpose rows are replaced by four stage-specific measurements.
+        for old_label in ('TV network', 'TV signal', 'Frame jitter', 'Connections'):
+            old_pat = r'(?m)^[ \t]*HudMetric\([^\n]*"' + re.escape(old_label) + r'"[^\n]*\n'
+            hud, n = re.subn(old_pat, '', hud, count=1)
+            if n != 1: raise RuntimeError(f'Build11 HUD removal for {old_label}: {n}')
+        (ROOT / ui).write_text(hud, encoding='utf-8')
+
+        # Safety assertions: the Build 10 pump still preserves compressed frame order.
+        renderer_text = (ROOT / renderer).read_text(encoding='utf-8')
+        service_text = (ROOT / service).read_text(encoding='utf-8')
+        assert 'c.releaseOutputBuffer(latest, true)' in renderer_text
+        assert 'if (pump != null) pump.receive(data, ntpTimeNs, isH265)' in service_text
+        assert 'c.queueInputBuffer(idx, 0, data.size, ptsUs, 0)' in renderer_text
+        assert 'MediaFormat.KEY_FRAME_RATE' in renderer_text
+        assert len(new_rows) == 4
+        print('PASS: Build11 stage timing probes installed; unchanged codec bitstream and video modes')
+        print('PASS: RX -> queue -> MediaCodec -> SurfaceTexture -> EGL measurements exposed in HUD')
+        print('NOTE: EGL swap is not physical display time; PTS age requires valid sender time mapping')
+        PY
+        git diff --check
+        git diff --stat
     - name: Compile and test APK assembly
       run: |
         chmod +x ./gradlew
@@ -1070,6 +1258,6 @@ jobs:
     - name: Upload test APK
       uses: actions/upload-artifact@v4
       with:
-        name: Mustafa-TV-Build10-LosslessReceiver-debug
+        name: Mustafa-TV-Build11-Diagnostics-debug
         path: app/build/outputs/apk/debug/app-debug.apk
         if-no-files-found: error
