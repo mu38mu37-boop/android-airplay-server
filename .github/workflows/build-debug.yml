@@ -1,4 +1,4 @@
-name: Mustafa TV - Build 11 Latency Tracing (Diagnostic Only)
+name: Mustafa TV - Build 12 Native Transport Investigation
 on:
   push:
     branches:
@@ -16,6 +16,7 @@ jobs:
       uses: actions/checkout@v4
       with:
         submodules: recursive
+        ref: 23fae6ddb1217a5ac7ace6c9fa4e6cd309778687
     - name: Set up JDK 21
       uses: actions/setup-java@v4
       with:
@@ -1247,6 +1248,290 @@ jobs:
         PY
         git diff --check
         git diff --stat
+    - name: Build 12 - trace native transport and validate NTP replies
+      run: |
+        python3 - <<'PY'
+        from pathlib import Path
+        C=Path('app/src/main/cpp')
+        U=C/'third_party/UxPlay/lib'
+        K=Path('app/src/main/kotlin/io/github/jqssun/airplay')
+        def patch(p,a,b):
+         s=p.read_text(); assert s.count(a)==1,(str(p),s.count(a),a[:100]); p.write_text(s.replace(a,b,1))
+        header=r'''#ifndef MUSTAFA_TRACE_H
+        #define MUSTAFA_TRACE_H
+        #include <stdint.h>
+        #ifdef __cplusplus
+        extern "C" {
+        #endif
+        /* Single active mirroring receiver. Values are aggregate diagnostics, never media data. */
+        enum { MT_TCP_BYTES, MT_TCP_PEAK, MT_READ_US, MT_PROCESS_US, MT_CALLBACK_US,
+               MT_RTT_US, MT_NTP_AGE_MS, MT_CORRECTION_US, MT_NTP_SAMPLES,
+               MT_NTP_REJECTS, MT_HEADER_AGE_MS, MT_COMPLETE_AGE_MS, MT_ACK_STATE,
+               MT_READ_TIMEOUTS, MT_CALLBACK_PEAK_US, MT_PROTOCOL, MT_COUNT };
+        uint64_t mustafa_mono_ns(void);
+        void mustafa_trace_reset(void);
+        void mustafa_trace_set(int index, int64_t value);
+        void mustafa_trace_max(int index, int64_t value);
+        void mustafa_trace_increment(int index);
+        void mustafa_trace_ntp(int64_t rtt_ns, int64_t correction_ns);
+        void mustafa_trace_snapshot(int64_t *values);
+        void mustafa_quick_ack_set(int enabled);
+        int mustafa_quick_ack_enabled(void);
+        #ifdef __cplusplus
+        }
+        #endif
+        #endif
+        '''
+        source=r'''#include "mustafa_trace.h"
+        #include <pthread.h>
+        #include <time.h>
+        #include <string.h>
+        static pthread_mutex_t trace_mutex = PTHREAD_MUTEX_INITIALIZER;
+        static int64_t trace_values[MT_COUNT];
+        static uint64_t last_ntp_ns;
+        static int quick_ack;
+        uint64_t mustafa_mono_ns(void) {
+            struct timespec t;
+            clock_gettime(CLOCK_MONOTONIC, &t);
+            return (uint64_t)t.tv_sec * 1000000000ULL + t.tv_nsec;
+        }
+        void mustafa_trace_reset(void) {
+            pthread_mutex_lock(&trace_mutex);
+            memset(trace_values, 0, sizeof(trace_values));
+            trace_values[MT_RTT_US] = trace_values[MT_NTP_AGE_MS] = -1;
+            trace_values[MT_HEADER_AGE_MS] = trace_values[MT_COMPLETE_AGE_MS] = -1;
+            trace_values[MT_PROTOCOL] = -1;
+            last_ntp_ns = 0;
+            pthread_mutex_unlock(&trace_mutex);
+        }
+        void mustafa_trace_set(int i, int64_t v) {
+            if (i < 0 || i >= MT_COUNT) return;
+            pthread_mutex_lock(&trace_mutex); trace_values[i] = v; pthread_mutex_unlock(&trace_mutex);
+        }
+        void mustafa_trace_max(int i, int64_t v) {
+            if (i < 0 || i >= MT_COUNT) return;
+            pthread_mutex_lock(&trace_mutex);
+            if (v > trace_values[i]) trace_values[i] = v;
+            pthread_mutex_unlock(&trace_mutex);
+        }
+        void mustafa_trace_increment(int i) {
+            if (i < 0 || i >= MT_COUNT) return;
+            pthread_mutex_lock(&trace_mutex); ++trace_values[i]; pthread_mutex_unlock(&trace_mutex);
+        }
+        void mustafa_trace_ntp(int64_t rtt, int64_t correction) {
+            pthread_mutex_lock(&trace_mutex);
+            trace_values[MT_RTT_US] = rtt / 1000;
+            trace_values[MT_CORRECTION_US] = correction / 1000;
+            ++trace_values[MT_NTP_SAMPLES];
+            last_ntp_ns = mustafa_mono_ns();
+            pthread_mutex_unlock(&trace_mutex);
+        }
+        void mustafa_trace_snapshot(int64_t *v) {
+            pthread_mutex_lock(&trace_mutex);
+            memcpy(v, trace_values, sizeof(trace_values));
+            v[MT_NTP_AGE_MS] = last_ntp_ns ? (int64_t)((mustafa_mono_ns()-last_ntp_ns)/1000000) : -1;
+            pthread_mutex_unlock(&trace_mutex);
+        }
+        void mustafa_quick_ack_set(int enabled) {
+            pthread_mutex_lock(&trace_mutex); quick_ack = !!enabled; pthread_mutex_unlock(&trace_mutex);
+        }
+        int mustafa_quick_ack_enabled(void) {
+            pthread_mutex_lock(&trace_mutex); int v=quick_ack; pthread_mutex_unlock(&trace_mutex); return v;
+        }
+        '''
+        (C/'mustafa_trace.h').write_text(header)
+        (C/'mustafa_trace.c').write_text(source)
+        patch(C/'CMakeLists.txt','set(BRIDGE_SOURCES\n','set(BRIDGE_SOURCES\n    ${CMAKE_CURRENT_SOURCE_DIR}/mustafa_trace.c\n')
+        p=C/'native_bridge.cpp'
+        patch(p,'#include "log_sink.h"','#include "log_sink.h"\n#include "mustafa_trace.h"')
+        patch(p,'    server_ctx_t *ctx = new server_ctx_t();','    mustafa_trace_reset();\n    server_ctx_t *ctx = new server_ctx_t();')
+        p.write_text(p.read_text()+r'''
+        extern "C" JNIEXPORT jlongArray JNICALL
+        Java_io_github_jqssun_airplay_bridge_NativeBridge_nativeTransportSnapshot(JNIEnv *env, jobject) {
+            int64_t values[MT_COUNT];
+            jlong copy[MT_COUNT];
+            mustafa_trace_snapshot(values);
+            for (int i=0; i<MT_COUNT; ++i) copy[i] = (jlong)values[i];
+            jlongArray result = env->NewLongArray(MT_COUNT);
+            if (result) env->SetLongArrayRegion(result, 0, MT_COUNT, copy);
+            return result;
+        }
+        extern "C" JNIEXPORT void JNICALL
+        Java_io_github_jqssun_airplay_bridge_NativeBridge_nativeQuickAck(JNIEnv *, jobject, jboolean enabled) {
+            mustafa_quick_ack_set(enabled);
+        }
+        ''')
+        p=U/'raop_rtp_mirror.c'
+        patch(p,'#include "raop_rtp_mirror.h"','#include "raop_rtp_mirror.h"\n#include "mustafa_trace.h"\n#include <sys/ioctl.h>')
+        patch(p,'    bool first_packet = true;','''    bool first_packet = true;
+            uint64_t mt_first_byte_ns = 0, mt_complete_ns = 0;
+            int64_t mt_header_age_ms = -1;
+            const int mt_quick_ack = mustafa_quick_ack_enabled();''')
+        patch(p,'            // The first 128 bytes are some kind of header for the payload that follows','''            // FIONREAD measures unread TCP bytes, NOT milliseconds and NOT sender backlog.
+                    if (payload == NULL && readstart == 0) {
+                        int waiting = 0;
+                        if (ioctl(stream_fd, FIONREAD, &waiting) == 0) {
+                            mustafa_trace_set(MT_TCP_BYTES, waiting);
+                            mustafa_trace_max(MT_TCP_PEAK, waiting);
+                        }
+                    }
+                    // The first 128 bytes are some kind of header for the payload that follows''')
+        patch(p,'                readstart = readstart + ret;\n            }\n\n            if (payload == NULL', '''                if (readstart == 0) mt_first_byte_ns = mustafa_mono_ns();
+                        readstart = readstart + ret;
+                    }
+        
+                    if (payload == NULL''')
+        patch(p,'            if (payload == NULL) {\n                payload = malloc(payload_size);','''            if (payload == NULL) {
+                        uint64_t mapped = raop_ntp_convert_remote_time(raop_rtp_mirror->ntp, ntp_timestamp_remote);
+                        mt_header_age_ms = mapped ? ((int64_t)raop_ntp_get_local_time()-(int64_t)mapped)/1000000 : -1;
+                        payload = malloc(payload_size);''')
+        old='if (sock_err == SOCKET_ERRORNAME(EAGAIN) || sock_err == SOCKET_ERRORNAME(EWOULDBLOCK)) continue; // Timeouts can happen even if the connection is fine'
+        s=p.read_text(); assert s.count(old)==2
+        s=s.replace(old,'''if (sock_err == SOCKET_ERRORNAME(EAGAIN) || sock_err == SOCKET_ERRORNAME(EWOULDBLOCK)) {
+                            mustafa_trace_increment(MT_READ_TIMEOUTS);
+                            continue;
+                        } // Preserve partial packet across socket timeouts.'''); p.write_text(s)
+        patch(p,'            switch (packet[4]) {','''            mt_complete_ns = mustafa_mono_ns();
+                    // QUICKACK is a Linux one-shot hint. Rearm after each COMPLETE packet.
+                    // Unlike TCP_NODELAY on a receive-only socket, this affects ACKs to the sender.
+                    // Never resize receive buffers or discard encrypted/H.264 bytes.
+                    if (mt_quick_ack) {
+        #ifdef TCP_QUICKACK
+                        int one = 1;
+                        int ack_result = setsockopt(stream_fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
+                        mustafa_trace_set(MT_ACK_STATE, ack_result == 0 ? 1 : -errno);
+        #else
+                        mustafa_trace_set(MT_ACK_STATE, -999);
+        #endif
+                    } else { mustafa_trace_set(MT_ACK_STATE, 0); }
+                    switch (packet[4]) {''')
+        patch(p,'                raop_rtp_mirror->callbacks.video_process(raop_rtp_mirror->callbacks.cls, raop_rtp_mirror->ntp, &video_data);','''                uint64_t mt_callback_start = mustafa_mono_ns();
+                        mustafa_trace_set(MT_READ_US, (int64_t)(mt_complete_ns-mt_first_byte_ns)/1000);
+                        mustafa_trace_set(MT_PROCESS_US, (int64_t)(mt_callback_start-mt_complete_ns)/1000);
+                        mustafa_trace_set(MT_HEADER_AGE_MS, mt_header_age_ms);
+                        mustafa_trace_set(MT_COMPLETE_AGE_MS, ntp_timestamp_local ?
+                            ((int64_t)raop_ntp_get_local_time()-(int64_t)ntp_timestamp_local)/1000000 : -1);
+                        raop_rtp_mirror->callbacks.video_process(raop_rtp_mirror->callbacks.cls, raop_rtp_mirror->ntp, &video_data);
+                        int64_t mt_callback_us = (int64_t)(mustafa_mono_ns()-mt_callback_start)/1000;
+                        mustafa_trace_set(MT_CALLBACK_US, mt_callback_us);
+                        mustafa_trace_max(MT_CALLBACK_PEAK_US, mt_callback_us);''')
+        p=U/'raop_ntp.c'
+        patch(p,'#include "raop.h"','#include "raop.h"\n#include "mustafa_trace.h"')
+        patch(p,'    raop_ntp->time_protocol = *time_protocol;','    raop_ntp->time_protocol = *time_protocol;\n    mustafa_trace_set(MT_PROTOCOL, (int)*time_protocol);')
+        # Validate echoed origin before using a sample: previous requests or truncated datagrams
+        # must not overwrite the clock offset. Keep the established 3-second cadence.
+        patch(p,'                recv_time = raop_ntp_get_local_time();','''                if (response_len < 32 || (response[1] & 0x7f) != 0x53 ||
+                            memcmp(response + 8, request + 24, 8) != 0) {
+                            mustafa_trace_increment(MT_NTP_REJECTS);
+                            goto mustafa_ntp_wait;
+                        }
+                        recv_time = raop_ntp_get_local_time();''')
+        patch(p,'                logger_log(raop_ntp->logger, LOGGER_DEBUG, "raop_ntp sync correction = %lld", correction);','''                mustafa_trace_ntp((t3-t0)-(t2-t1), correction);
+                        logger_log(raop_ntp->logger, LOGGER_DEBUG, "raop_ntp sync correction = %lld", correction);''')
+        patch(p,'        // Sleep for 3 seconds','        mustafa_ntp_wait: ;\n        // Sleep for 3 seconds')
+        p=K/'bridge/NativeBridge.kt'
+        patch(p,'    external fun nativeStart(handle: Long, port: Int): Int','''    external fun nativeTransportSnapshot(): LongArray
+            external fun nativeQuickAck(enabled: Boolean)
+            external fun nativeStart(handle: Long, port: Int): Int''')
+        p=K/'Prefs.kt'
+        patch(p,'    val LOW_LATENCY = bool("low_latency", false)','''    val LOW_LATENCY = bool("low_latency", false)
+            val NATIVE_QUICK_ACK = bool("native_quick_ack", false, restart = true)''')
+        p=K/'service/AirPlayService.kt'
+        patch(p,'        val port = NativeBridge.nativeStart(nativeHandle, requestedPort)','''        NativeBridge.nativeQuickAck(prefs[Prefs.NATIVE_QUICK_ACK])
+                val port = NativeBridge.nativeStart(nativeHandle, requestedPort)''')
+        patch(p,'        receiverQueueDepth = videoPacketPump?.queueDepth ?: 0,','''        receiverQueueDepth = videoPacketPump?.queueDepth ?: 0,
+                nativeTrace = NativeBridge.nativeTransportSnapshot().toList(),''')
+        p=K/'viewmodel/MainViewModel.kt'
+        patch(p,'    val receiverQueueDepth: Int = 0,','''    val receiverQueueDepth: Int = 0,
+            val nativeTrace: List<Long> = emptyList(),''')
+        p=K/'ui/SettingsScreen.kt'
+        patch(p,'    val lowLatency by viewModel.pref(Prefs.LOW_LATENCY).collectAsState()', '''    val lowLatency by viewModel.pref(Prefs.LOW_LATENCY).collectAsState()
+            val nativeQuickAck by viewModel.pref(Prefs.NATIVE_QUICK_ACK).collectAsState()''')
+        patch(p,'                title = "Fast AirPlay receiver (Build 10)",','''                    title = "Native TCP quick ACK (Build 12)",
+                            description = "Optional transport experiment. Preserves image quality; reconnects AirPlay. OFF is the previous TCP behavior.",
+                            checked = nativeQuickAck,
+                            onCheckedChange = { viewModel.set(Prefs.NATIVE_QUICK_ACK, it) }
+                        )
+                        SettingSwitch(
+                            title = "Fast AirPlay receiver (Build 10)",''')
+        p=K/'ui/MainScreen.kt'
+        s=p.read_text()
+        anchor='private fun DebugOverlay(info: DebugInfo, modifier: Modifier = Modifier) {'
+        assert s.count(anchor)==1
+        s=s.replace(anchor,anchor+'''
+            val nt = info.nativeTrace
+            fun n(i: Int): Long = nt.getOrNull(i) ?: -1L
+            fun ms(i: Int): String = if (n(i) < 0) "n/a" else "${n(i) / 1000}"
+            val ack = when { n(12) == 1L -> "ON"; n(12) == 0L -> "OFF"; else -> "ERR" }
+        ''',1)
+        # Keep panel compact; retain RX/Codec/GL stage rows. Raw trace copied through logs below.
+        import re
+        rows={
+         'Stream bitrate':'HudMetric(Icons.Default.NetworkCheck, "TCP KB / peak", "${n(0)/1024} / ${n(1)/1024}", Color(0xFFE0F2FF))',
+         'Dropped frames':'HudMetric(Icons.Default.Timelapse, "Read / native / JNI ms", "${ms(2)} / ${ms(3)} / ${ms(4)}", Color(0xFFE0F2FF))',
+         'Codec / GL frames':'HudMetric(Icons.Default.NetworkCheck, "NTP RTT / age ms", "${ms(5)} / ${n(6)}", Color(0xFFDEF5EF))',
+         'Receive / feed':'HudMetric(Icons.Default.NetworkCheck, "RX / feed / ACK", "${info.receiverFps}/${info.fedFps} $ack", Color(0xFFDEF5EF))',
+        }
+        for label,row in rows.items():
+         pat=r'(?m)^([ \t]*)HudMetric\([^\n]*"'+re.escape(label)+r'"[^\n]*$'
+         s,count=re.subn(pat,lambda m:m.group(1)+row,s); assert count==1,(label,count)
+        p.write_text(s)
+        # Store a compact transport snapshot in existing in-app log UI, once per 3 seconds.
+        # This avoids adb and never logs keys, packet contents, identities or IP addresses.
+        p=K/'service/AirPlayService.kt'
+        patch(p,'    private fun log(msg: String) {','''    private var lastNativeTraceLogMs = 0L
+            private fun transportSnapshot(): List<Long> {
+                val v = NativeBridge.nativeTransportSnapshot().toList()
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastNativeTraceLogMs >= 3000L && videoRenderer.frameCount > 0) {
+                    lastNativeTraceLogMs = now
+                    log("MT12 tcpB/peak=${v[0]}/${v[1]} read/parse/jniUs=${v[2]}/${v[3]}/${v[4]} " +
+                        "ntpRttUs/ageMs/correctionUs=${v[5]}/${v[6]}/${v[7]} samples/rejects=${v[8]}/${v[9]} " +
+                        "header/callbackPtsAgeMs=${v[10]}/${v[11]} ack=${v[12]} timeouts=${v[13]} " +
+                        "jniPeakUs=${v[14]} protocol=${v[15]}")
+                }
+                return v
+            }
+        
+            private fun log(msg: String) {''')
+        patch(p,'nativeTrace = NativeBridge.nativeTransportSnapshot().toList(),','nativeTrace = transportSnapshot(),')
+        # Imports already present in baseline?
+        s=p.read_text()
+        if 'import android.os.SystemClock' not in s:
+         patch(p,'import android.os.', 'import android.os.') if False else None
+         s=s.replace('package io.github.jqssun.airplay.service','package io.github.jqssun.airplay.service\n\nimport android.os.SystemClock',1); p.write_text(s)
+        # Mark version without changing app ID, key, screen negotiation, codec or GL behavior.
+        p=Path('app/build.gradle.kts')
+        patch(p,'versionCode = 36','versionCode = 37')
+        patch(p,'versionName = "0.0.36"','versionName = "0.0.36-mustafa12"')
+        assert 'fifo.clear()' not in (U/'raop_rtp_mirror.c').read_text()
+        assert 'applyAspectRatio = false' in (K/'ui/MainScreen.kt').read_text()
+        print('PASS: MT12 native transport probes, NTP reply validation, optional QUICKACK; quality settings unchanged')
+        # Same-frame receive-to-EGL duration uses only System.nanoTime(), independent of NTP.
+        p=K/'renderer/VideoRenderer.kt'
+        patch(p,'    private val queuedAtNs = LinkedHashMap<Long, Long>()','''    private val queuedAtNs = LinkedHashMap<Long, Long>()
+            private val receivedAtNs = java.util.concurrent.ConcurrentHashMap<Long, Long>()
+            @Volatile var receiveToGlMs = -1L; private set''')
+        patch(p,'        rxPtsAgeMs = ptsAgeMs(ptsNs)','''        rxPtsAgeMs = ptsAgeMs(ptsNs)
+                receivedAtNs[ptsNs / 1000L] = System.nanoTime()
+                // Diagnostic map only; never removes video packets.
+                if (receivedAtNs.size > 256) receivedAtNs.keys.firstOrNull()?.let { receivedAtNs.remove(it) }''')
+        patch(p,'            glFrameCount++','''            glFrameCount++
+                    val received = receivedAtNs.remove(presentationTimeNs / 1000L)
+                    receiveToGlMs = if (received != null) (System.nanoTime() - received) / 1_000_000L else -1L''')
+        patch(p,'        rxPtsAgeMs = -1L; codecPtsAgeMs = -1L; glPtsAgeMs = -1L','''        receivedAtNs.clear()
+                receiveToGlMs = -1L
+                rxPtsAgeMs = -1L; codecPtsAgeMs = -1L; glPtsAgeMs = -1L''')
+        p=K/'viewmodel/MainViewModel.kt'
+        patch(p,'    val nativeTrace: List<Long> = emptyList(),','    val nativeTrace: List<Long> = emptyList(),\n    val receiveToGlMs: Long = -1L,')
+        p=K/'service/AirPlayService.kt'
+        patch(p,'        nativeTrace = transportSnapshot(),','        nativeTrace = transportSnapshot(),\n        receiveToGlMs = videoRenderer.receiveToGlMs,')
+        patch(p,'"jniPeakUs=${v[14]} protocol=${v[15]}")','"jniPeakUs=${v[14]} protocol=${v[15]} rxToGlMs=${videoRenderer.receiveToGlMs}")')
+        p=K/'ui/MainScreen.kt'
+        patch(p,'"Decode / GL time", "${info.decoderResidenceMs} / ${info.glSubmitMs} ms"','"RX-GL / decode / GL", "${info.receiveToGlMs}/${info.decoderResidenceMs}/${info.glSubmitMs} ms"')
+        print('PASS: same-frame receive-to-EGL monotonic measurement installed')
+        PY
+        git diff --check
     - name: Compile and test APK assembly
       run: |
         chmod +x ./gradlew
@@ -1258,6 +1543,7 @@ jobs:
     - name: Upload test APK
       uses: actions/upload-artifact@v4
       with:
-        name: Mustafa-TV-Build11-Diagnostics-debug
+        name: Mustafa-TV-Build12-Native-Transport-debug
         path: app/build/outputs/apk/debug/app-debug.apk
         if-no-files-found: error
+
