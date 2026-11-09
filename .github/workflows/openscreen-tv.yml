@@ -1,0 +1,410 @@
+name: OpenScreen TV V3 - Build APK
+on:
+  workflow_dispatch:
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout build kit
+        uses: actions/checkout@v4
+      - name: Install JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Install Android build packages
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager --install 'platforms;android-37' 'build-tools;37.0.0' 'ndk;27.0.12077973' 'cmake;3.22.1'
+      - name: Materialize OpenScreen TV V3 build kit
+        run: |
+          set -euo pipefail
+          mkdir -p tools branding
+          cat > tools/prepare_source.py <<'PY_PREPARE'
+          #!/usr/bin/env python3
+          """Prepare a GPLv3 AirPlay receiver fork for Android TV builds.
+          
+          Clones a pinned public upstream source and applies our independent package/branding.
+          No code or assets from the proprietary AirScreen APK are copied.
+          """
+          from pathlib import Path
+          import argparse
+          import re
+          import shutil
+          import subprocess
+          import sys
+          
+          UPSTREAM = 'https://github.com/jqssun/android-airplay-server.git'
+          REVISION = 'a46cca0a6a1274e9e33c0e750f0f1c1eb1d881ea'
+          PACKAGE = 'org.openscreen.tv'
+          
+          
+          def run(*args, cwd=None):
+              print('+', ' '.join(str(a) for a in args), flush=True)
+              subprocess.run([str(a) for a in args], cwd=cwd, check=True)
+          
+          
+          def replace_once(path: Path, old: str, new: str):
+              text = path.read_text(encoding='utf-8')
+              if text.count(old) != 1:
+                  raise RuntimeError(f'Expected exactly one occurrence of {old!r} in {path}, got {text.count(old)}')
+              path.write_text(text.replace(old, new), encoding='utf-8')
+          
+          
+          def prepare(repo: Path, assets: Path):
+              gradle = repo/'app/build.gradle.kts'
+              replace_once(gradle, 'applicationId = "io.github.jqssun.airplay"', f'applicationId = "{PACKAGE}"')
+              # Keep namespace and Kotlin package paths untouched to avoid breaking upstream JNI/Hilt wiring.
+              prefs = repo/'app/src/main/kotlin/io/github/jqssun/airplay/Prefs.kt'
+              replace_once(prefs, 'str("server_name", "Android AirPlay", restart = true)', 'str("server_name", "OpenScreen TV", restart = true)')
+              strings = repo/'app/src/main/res/values/strings.xml'
+              replace_once(strings, '<string name="app_name">AirPlay Server</string>', '<string name="app_name">OpenScreen TV</string>')
+              replace_once(strings, '<string name="notification_title">AirPlay Server Running</string>', '<string name="notification_title">OpenScreen TV Running</string>')
+              replace_once(strings, '<string name="notification_channel">AirPlay Service</string>', '<string name="notification_channel">OpenScreen TV Service</string>')
+              manifest = repo/'app/src/main/AndroidManifest.xml'
+              replace_once(manifest, 'android:icon="@mipmap/ic_launcher"', 'android:icon="@drawable/openscreen_icon"')
+              replace_once(manifest, 'android:roundIcon="@mipmap/ic_launcher_round"', 'android:roundIcon="@drawable/openscreen_icon"')
+              replace_once(manifest, 'android:banner="@drawable/banner"', 'android:banner="@drawable/openscreen_banner"')
+              drawable = repo/'app/src/main/res/drawable-nodpi'
+              drawable.mkdir(parents=True, exist_ok=True)
+              for file in ('openscreen_icon.png','openscreen_banner.png'):
+                  shutil.copy2(assets/file, drawable/file)
+              # Existing strings in other locale directories may still display upstream's translated title;
+              # app_name is explicitly replaced wherever it occurs to avoid inconsistent launcher labels.
+              for path in (repo/'app/src/main/res').glob('values-*/strings.xml'):
+                  text=path.read_text(encoding='utf-8')
+                  text, count=re.subn(r'(<string\s+name="app_name"[^>]*>).*?(</string>)',r'\g<1>OpenScreen TV\2',text,count=1,flags=re.S)
+                  if count:
+                      path.write_text(text,encoding='utf-8')
+              # Stretch mirroring by sizing the SurfaceView to the entire TV viewport.
+              # Android's EGL VideoPipeline renders the full texture into the surface; no crop.
+              replace_once(prefs,
+                  '    val AUTO_FULLSCREEN = bool("auto_fullscreen", true)',
+                  '    val AUTO_FULLSCREEN = bool("auto_fullscreen", true)\n'
+                  '    val STRETCH_MIRRORING = bool("stretch_mirroring", true)\n'
+                  '    val STRETCH_VIDEO = bool("stretch_video", true)')
+              main = repo/'app/src/main/kotlin/io/github/jqssun/airplay/ui/MainScreen.kt'
+              replace_once(main,
+                  '    val autoFullscreen by viewModel.pref(Prefs.AUTO_FULLSCREEN).collectAsState()\n',
+                  '    val autoFullscreen by viewModel.pref(Prefs.AUTO_FULLSCREEN).collectAsState()\n'
+                  '    val stretchMirroring by viewModel.pref(Prefs.STRETCH_MIRRORING).collectAsState()\n')
+              replace_once(main,
+                  '            aspectRatio = aspect\n        )\n',
+                  '            aspectRatio = aspect,\n'
+                  '            applyAspectRatio = !(fullscreen && stretchMirroring),\n'
+                  '            modifier = if (fullscreen && stretchMirroring) Modifier.fillMaxSize() else Modifier\n        )\n')
+              replace_once(main,
+                  '        val zoomState = remember(viewModel) { ZoomState(viewModel, gestureScope) }',
+                  '        val stretchVideo by viewModel.pref(Prefs.STRETCH_VIDEO).collectAsState()\n'
+                  '        val zoomState = remember(viewModel, stretchVideo) {\n'
+                  '            ZoomState(viewModel, gestureScope, if (stretchVideo) VideoContentScale.STRETCH else VideoContentScale.BEST_FIT)\n'
+                  '        }')
+              gesture = repo/'app/src/main/kotlin/io/github/jqssun/airplay/ui/gestures/GestureStates.kt'
+              replace_once(gesture,
+                  '    private val scope: CoroutineScope,\n) {\n    var zoom by mutableFloatStateOf(1f)',
+                  '    private val scope: CoroutineScope,\n    private val defaultContentScale: VideoContentScale = VideoContentScale.BEST_FIT,\n) {\n    var zoom by mutableFloatStateOf(1f)')
+              replace_once(gesture,
+                  '    var contentScale by mutableStateOf(VideoContentScale.BEST_FIT)',
+                  '    var contentScale by mutableStateOf(defaultContentScale)')
+              replace_once(gesture,
+                  '        contentScale = VideoContentScale.BEST_FIT',
+                  '        contentScale = defaultContentScale')
+              settings = repo/'app/src/main/kotlin/io/github/jqssun/airplay/ui/SettingsScreen.kt'
+              replace_once(settings,
+                  '    val autoFullscreen by viewModel.pref(Prefs.AUTO_FULLSCREEN).collectAsState()\n',
+                  '    val autoFullscreen by viewModel.pref(Prefs.AUTO_FULLSCREEN).collectAsState()\n'
+                  '    val stretchMirroring by viewModel.pref(Prefs.STRETCH_MIRRORING).collectAsState()\n'
+                  '    val stretchVideo by viewModel.pref(Prefs.STRETCH_VIDEO).collectAsState()\n')
+              replace_once(settings,
+                  '        SettingResolution(\n',
+                  '        SettingSwitch(\n'
+                  '            title = stringResource(R.string.setting_stretch_mirroring),\n'
+                  '            description = stringResource(R.string.setting_stretch_mirroring_desc),\n'
+                  '            checked = stretchMirroring,\n'
+                  '            onCheckedChange = { viewModel.set(Prefs.STRETCH_MIRRORING, it) }\n'
+                  '        )\n\n'
+                  '        SettingSwitch(\n'
+                  '            title = stringResource(R.string.setting_stretch_video),\n'
+                  '            description = stringResource(R.string.setting_stretch_video_desc),\n'
+                  '            checked = stretchVideo,\n'
+                  '            onCheckedChange = { viewModel.set(Prefs.STRETCH_VIDEO, it) }\n'
+                  '        )\n\n'
+                  '        SettingResolution(\n')
+              replace_once(strings,
+                  '    <!-- Settings: Display -->',
+                  '    <!-- Settings: Display -->\n'
+                  '    <string name="setting_stretch_mirroring">Full screen stretch (mirroring)</string>\n'
+                  '    <string name="setting_stretch_mirroring_desc">Fill the TV screen with no crop or letterbox; may distort aspect ratio</string>\n'
+                  '    <string name="setting_stretch_video">Full screen stretch (video)</string>\n'
+                  '    <string name="setting_stretch_video_desc">Default to stretch during AirPlay video playback; can be changed with player controls</string>')
+              # Add Arabic labels while retaining upstream translations for other UI strings.
+              ar = repo/'app/src/main/res/values-ar'
+              ar.mkdir(parents=True, exist_ok=True)
+              ar_strings = ar/'strings.xml'
+              if ar_strings.exists():
+                  txt=ar_strings.read_text(encoding='utf-8')
+                  if '</resources>' not in txt: raise RuntimeError('Unexpected Arabic strings.xml')
+                  addition='    <string name="setting_stretch_mirroring">ملء الشاشة بالتمدد (نسخ الشاشة)</string>\n    <string name="setting_stretch_mirroring_desc">يملأ شاشة التلفزيون بلا قص أو حواف سوداء، وقد يغيّر تناسب الصورة</string>\n    <string name="setting_stretch_video">ملء الشاشة بالتمدد (الفيديو)</string>\n    <string name="setting_stretch_video_desc">التمدد افتراضياً عند تشغيل الفيديو، ويمكن تغييره من أدوات المشغل</string>\n'
+                  ar_strings.write_text(txt.replace('</resources>', addition+'</resources>'),encoding='utf-8')
+              else:
+                  ar_strings.write_text('<resources>\n' + '    <string name="setting_stretch_mirroring">ملء الشاشة بالتمدد (نسخ الشاشة)</string>\n    <string name="setting_stretch_mirroring_desc">يملأ شاشة التلفزيون بلا قص أو حواف سوداء، وقد يغيّر تناسب الصورة</string>\n    <string name="setting_stretch_video">ملء الشاشة بالتمدد (الفيديو)</string>\n    <string name="setting_stretch_video_desc">التمدد افتراضياً عند تشغيل الفيديو، ويمكن تغييره من أدوات المشغل</string>\n' + '</resources>\n', encoding='utf-8')
+              # A consistent high-contrast TV-first palette; avoids device-dependent dynamic colors.
+              theme = repo/'app/src/main/kotlin/io/github/jqssun/airplay/ui/theme/Theme.kt'
+              theme.write_text('''package io.github.jqssun.airplay.ui.theme
+          
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.darkColorScheme
+          import androidx.compose.runtime.Composable
+          import androidx.compose.ui.graphics.Color
+          
+          private val OpenScreenColors = darkColorScheme(
+              primary = Color(0xFF9DDCFF),
+              onPrimary = Color(0xFF09233B),
+              secondary = Color(0xFFD4B6FF),
+              onSecondary = Color(0xFF2A1943),
+              tertiary = Color(0xFF9BE9D7),
+              background = Color(0xFF0B1220),
+              onBackground = Color(0xFFF4F7FF),
+              surface = Color(0xFF172237),
+              onSurface = Color(0xFFF4F7FF),
+              surfaceVariant = Color(0xFF24344F),
+              onSurfaceVariant = Color(0xFFD6E2F5),
+              outline = Color(0xFF7C90B0),
+              error = Color(0xFFFFB5BF)
+          )
+          
+          @Composable
+          fun AirPlayTheme(
+              darkTheme: Boolean = true,
+              content: @Composable () -> Unit
+          ) {
+              MaterialTheme(colorScheme = OpenScreenColors, content = content)
+          }
+          ''', encoding='utf-8')
+              # Keep existing upstream code and GPL notices intact; add derivative notice.
+              (repo/'OPENSCREEN_DERIVATIVE_NOTICE.txt').write_text(
+                  'OpenScreen TV is an independent GPL-3.0 derivative of jqssun/android-airplay-server.\n'
+                  f'Upstream source: {UPSTREAM}\nUpstream revision: {REVISION}\n'
+                  'Modifications: app ID, branding, dark TV theme, default stretch modes, and two display settings.\n'
+                  'No proprietary AirScreen code or assets were used.\n'
+                  'Source code of the complete derivative is available in this build checkout.\n', encoding='utf-8')
+              print(f'Prepared OpenScreen TV at {repo}')
+          
+          
+          def main():
+              parser=argparse.ArgumentParser()
+              parser.add_argument('--source',type=Path,help='Use an existing checkout (for offline testing)')
+              parser.add_argument('--output',type=Path,default=Path('openscreen-src'))
+              args=parser.parse_args()
+              root=Path(__file__).resolve().parent.parent
+              target=args.source.resolve() if args.source else args.output.resolve()
+              if not args.source:
+                  if target.exists():
+                      raise SystemExit(f'Refusing to overwrite existing folder: {target}')
+                  run('git','clone','--recursive',UPSTREAM,target)
+                  run('git','checkout',REVISION,cwd=target)
+                  actual = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=target, text=True).strip()
+                  if actual != REVISION:
+                      raise RuntimeError(f'Unexpected upstream revision: {actual}')
+                  run('git','submodule','update','--init','--recursive',cwd=target)
+              prepare(target,root/'branding')
+          
+          if __name__=='__main__':
+              main()
+          PY_PREPARE
+          base64 -d > branding/openscreen_icon.png <<'B64_OPENSCREEN_ICON_PNG'
+          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
+          B64_OPENSCREEN_ICON_PNG
+          base64 -d > branding/openscreen_banner.png <<'B64_OPENSCREEN_BANNER_PNG'
+          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
+          aA9KyP9T149UZLKLV5+mikqfRNmxu4fCqvyTUNUqVZpGvMHY1ekcWOd9IyPLsOjD+edqcsHDLLYs
+          kcm6+VX69CzXQH+ufOvMuX8LK31SNBg9PQ6hdT6fvCZwuPYuLvpOX6+EPk14/jwl4aj32PJvJHUN
+          8r9yoHzzSmUyp0EDuIYpR44K2jFoAPQ+B9aedXVm2FiJcpKffDiRC7Ctu5tFW6uCrEcMw9j369P0
+          /1848G9h4e1z9D7SCerIMLeRjPXalQaxhpmXce9+anr5gomJy2B/tsi//px69IRapdJ6KRg5g90H
+          NvoMiztA/qUsl6AAhr2r5F1xVyklAcfPjZEhP9SO3cWN73C6IfxvSjt2MuDNaVKZjGEYK/vOVvad
+          rR0duOc68u5lZqakVbsCME6G/1TKhrC7G5+nBQW3z11w9C3/OmmXoABrh67cT/nzMzQqeJSSDP5F
+          ZnflS3a9PMsXnj9POYLHJxspBJgM/m3e5q1amkjK/3YZydfzH9T0QwXByCDAZKhVqrRjJ7Xrr+P2
+          byOGAFOinVV1aanm09HQmCDAlGi/2ejm6bPPiorE6g+Irk5fbgYA4sIMDEAYAgxAWL1/wXcNCfP8
+          Fh4yASODGRiAMAQYgDAEGIAwBBiAMNwHBiAMMzAAYQgwAGEIMABhCDAAYQgwAGEIMABhCDAAYQgw
+          AGEIMABhCDAAYQgwAGEIMABhCDAAYQgwAGEIMABhCDAAYQgwAGEIMABhCDAAYQgwAGEIMABhCDAA
+          YQgwAGEIMABhCDAAYQgwAGEIMABhCDAAYQgwAGEIMABhCDAAYQgwAGEIMABhCDAAYQgwAGEIMABh
+          CDAAYQgwAGEIMABhCDAAYQgwAGEIMABhCDAAYQgwAGEIMABhCDAAYQgwAGEIMABhCDAAYQgwAGEI
+          MABhCDAAYQgwAGEIMABhCDAAYQgwAGEIMABhCDAAYQgwAGEIMABhCDAAYQgwAGEIMABhCDAAYQgw
+          AGEIMABh/wNdKr96xZQazwAAAABJRU5ErkJggg==
+          B64_OPENSCREEN_BANNER_PNG
+      - name: Fetch pinned GPL source and apply V3 branding + stretch
+        run: python3 tools/prepare_source.py --output openscreen-src
+      - name: Build APK
+        run: |
+          cd openscreen-src
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleDebug --stacktrace
+      - name: Verify APK identity, TV launcher and native ABIs
+        run: |
+          set -euo pipefail
+          APK=openscreen-src/app/build/outputs/apk/debug/app-debug.apk
+          test -s "$APK"
+          AAPT="$ANDROID_HOME/build-tools/37.0.0/aapt"
+          "$AAPT" dump badging "$APK" | tee /tmp/badging.txt
+          grep -q "package: name='org.openscreen.tv'" /tmp/badging.txt
+          grep -q "leanback-launchable-activity:" /tmp/badging.txt
+          python3 - <<'PYCODE'
+          import zipfile
+          apk = 'openscreen-src/app/build/outputs/apk/debug/app-debug.apk'
+          with zipfile.ZipFile(apk) as z:
+              libs = [n for n in z.namelist() if n.startswith('lib/') and n.endswith('.so')]
+              assert libs, 'APK has no native libraries: AirPlay engine likely missing'
+              assert any(n.startswith('lib/arm64-v8a/') or n.startswith('lib/armeabi-v7a/') for n in libs), 'Missing ARM native libraries'
+              print('Native libraries:', len(libs))
+          PYCODE
+      - name: Package APK and GPL corresponding source
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          cp openscreen-src/app/build/outputs/apk/debug/app-debug.apk output/OpenScreenTV-debug.apk
+          tar -czf output/OpenScreenTV-corresponding-source.tar.gz \
+            --exclude='.git' --exclude='.gradle' --exclude='build' \
+            --exclude='.cxx' --exclude='output' openscreen-src
+          (cd output && sha256sum OpenScreenTV-debug.apk OpenScreenTV-corresponding-source.tar.gz > SHA256SUMS.txt)
+          ls -lh output/
+      - name: Upload installable debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenScreenTV-Android14-APK-and-Source
+          path: output/
+          if-no-files-found: error
+          retention-days: 30
